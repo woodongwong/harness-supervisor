@@ -4,25 +4,11 @@ Harness Supervisor keeps **Codex and ZCode as native harnesses**. It does not ro
 
 ## Goal
 
-The main failure case is simple: Codex is working under a subscription, then its quota is exhausted before it can summarize. The supervisor hands the same task to ZCode without asking Codex for a final response. The inverse direction (ZCode → Codex) is also supported.
+The main failure case is simple: Codex is working under a subscription, then its quota is exhausted before it can summarize. The supervisor preserves the observable task state so the same task can be handed to ZCode without asking Codex for a final response. The inverse direction (ZCode → Codex) is also supported at the state/handoff layer.
 
-## Architecture
+## Current integration status
 
-```text
-                     Supervisor
-           task.json / events.jsonl / context.md
-                         |
-              +----------+----------+
-              |                     |
-        CodexAdapter             ZCodeAdapter
-              |                     |
-       codex exec --json       ZCode native runtime
-       native thread id        + bridge plugin hooks
-              |                     |
-              +------ same Git workspace ------+
-```
-
-### Codex integration
+### Codex
 
 Codex is the deep integration path:
 
@@ -32,29 +18,39 @@ Codex is the deep integration path:
 - can resume the native thread later
 - detects quota/auth/transport/process failures from native errors/stderr
 
-No final summary is required for failover.
+### ZCode
 
-### ZCode integration
+ZCode is treated as a closed-source harness. The **officially supported integration path today is its plugin/hook API**:
 
-ZCode is treated as a closed-source harness with capability negotiation:
-
-- launcher command is configurable; default: `zcode --prompt "..."`
-- included ZCode Hook plugin records `SessionStart`, prompt, tool, permission, tool failure, and `Stop` events
+- the included ZCode Hook plugin records `SessionStart`, prompt, tool, permission, tool failure, and `Stop` events
 - each hook invocation snapshots ZCode's temporary `transcript_path` into durable task storage
-- `SessionStart` injects the supervisor's `context.md` into a new ZCode session
-- native resume is **not assumed**; if a launcher exposes it, configure `ZCODE_SUPERVISOR_RESUME_ARGS_JSON`
+- `SessionStart` can inject the supervisor's `context.md` into a new ZCode session
+- native/headless launch and resume are **not assumed**
 
-## Run
+ZCode's public documentation currently describes the desktop application and Hook/plugin interfaces, but not a stable `zcode --prompt` headless CLI contract. Therefore automatic ZCode process launching is only enabled when you explicitly configure a launcher via `ZCODE_SUPERVISOR_ARGS_JSON`; do not rely on the built-in placeholder default as an official ZCode interface.
 
-Requires Node.js 20+.
+## Requirements
+
+- Node.js 20+
+- Codex CLI installed and authenticated for Codex execution
+- ZCode installed and authenticated for ZCode execution
+
+## Check the repository
 
 ```bash
+npm test
+npm run check
 node src/cli.mjs capabilities
+```
+
+## Run Codex as the primary worker
+
+```bash
 node src/cli.mjs run \
   --cwd /path/to/repo \
   --task "Fix the refresh-token race and run affected tests" \
   --primary codex \
-  --fallback zcode
+  --fallback none
 ```
 
 Persistent state defaults to `~/.harness-supervisor/tasks/<task-id>/`:
@@ -67,47 +63,44 @@ context.md
 native/zcode-*.jsonl
 ```
 
-Manual takeover:
+## Install the ZCode bridge plugin
 
-```bash
-node src/cli.mjs takeover task-... \
-  --to codex \
-  --feedback "ZCode quota is exhausted; continue from the current diff"
-```
+The repository includes a root `marketplace.json`, so ZCode can load the bridge as a custom marketplace.
 
-## ZCode bridge plugin
+1. In ZCode open **Settings -> Plugins**.
+2. Click **Create -> Add marketplace**.
+3. Add this repository (or a local checkout of it).
+4. In the Personal marketplace, install and enable `harness-supervisor-bridge`.
+5. Start a **new ZCode session** after enabling the plugin; hook configuration is snapshotted at session startup.
 
-Install `zcode-plugin/` as a local ZCode plugin and enable it. The plugin uses ZCode's Hook protocol; it does not patch or reverse-engineer the ZCode process.
-
-When the supervisor launches ZCode it exports:
-
-```text
-HARNESS_SUPERVISOR_TASK_ID
-HARNESS_SUPERVISOR_TASK_DIR
-HARNESS_SUPERVISOR_CONTEXT_FILE
-HARNESS_SUPERVISOR_EVENT_SINK
-```
-
-Without those variables the plugin writes to `ZCODE_PLUGIN_DATA/native-harness-events.jsonl` instead.
+The plugin uses ZCode's documented Hook protocol; it does not patch or reverse-engineer the ZCode process.
 
 ## ZCode launcher configuration
 
-Default:
+If you have a real ZCode launcher/runtime that accepts a prompt non-interactively, configure it explicitly:
 
-```text
-ZCODE_BIN=zcode
-ZCODE_SUPERVISOR_ARGS_JSON=["--prompt","{prompt}"]
+```bash
+export ZCODE_BIN=/path/to/your/zcode-launcher
+export ZCODE_SUPERVISOR_ARGS_JSON='["--prompt","{prompt}"]'
 ```
 
 Supported placeholders: `{prompt}`, `{session}`, `{cwd}`, `{task}`.
 
-If a specific ZCode runtime exposes resume, opt in explicitly, for example:
+If that launcher also supports resume, configure it explicitly, for example:
 
 ```bash
 export ZCODE_SUPERVISOR_RESUME_ARGS_JSON='["resume","{session}","--prompt","{prompt}"]'
 ```
 
-The supervisor only advertises `resumeSession: true` after this is configured.
+Only after a working launcher is configured should you use automatic Codex -> ZCode failover:
+
+```bash
+node src/cli.mjs run \
+  --cwd /path/to/repo \
+  --task "Fix the refresh-token race and run affected tests" \
+  --primary codex \
+  --fallback zcode
+```
 
 ## Codex configuration
 
@@ -119,9 +112,21 @@ export CODEX_SUPERVISOR_ARGS_JSON='["--sandbox","workspace-write"]'
 
 The supervisor deliberately does not force `--dangerously-bypass-approvals-and-sandbox`.
 
+## Manual takeover
+
+The state layer supports explicit takeover:
+
+```bash
+node src/cli.mjs takeover task-... \
+  --to codex \
+  --feedback "ZCode quota is exhausted; continue from the current diff"
+```
+
+A ZCode takeover still needs a configured non-interactive ZCode launcher in the current MVP. Without that launcher, use the bridge plugin to observe/persist ZCode sessions, but start the ZCode session manually in the desktop client.
+
 ## Failure semantics
 
-Automatic failover occurs for `quota`, `auth`, `transport`, and generic process failures. The takeover prompt is built from the original goal, recent durable Codex/ZCode journal events, current Git status, and staged/unstaged diffs.
+Automatic failover occurs for `quota`, `auth`, `transport`, and generic process failures. The takeover context is built from the original goal, recent durable Codex/ZCode journal events, current Git status, and staged/unstaged diffs.
 
 Unobservable model-internal reasoning cannot be recovered; observable work is made durable as it happens.
 
@@ -132,4 +137,4 @@ npm test
 npm run check
 ```
 
-The tests use fake child processes and do not consume Codex or ZCode quota.
+The tests use fake child processes and do not consume Codex or ZCode quota. They are unit/integration-style tests for the supervisor logic, not a real subscription/quota end-to-end test against live Codex and ZCode accounts.
