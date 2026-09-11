@@ -54,3 +54,32 @@ function runBridge(input, env) {
     child.stdin.end(`${JSON.stringify(input)}\n`);
   });
 }
+
+test("manual desktop session discovers a workspace binding, but another session cannot attach",async()=>{
+ const {bindWorkspace,unbindWorkspace}=await import("../zcode-plugin/hooks/bindings.mjs");
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),"hs-bound-"));
+ const taskDir=path.join(dir,"tasks","task-bound");await fs.mkdir(taskDir,{recursive:true});
+ await fs.writeFile(path.join(taskDir,"context.md"),"manual takeover instructions");
+ const task={id:"task-bound",cwd:dir};await bindWorkspace(dir,task,taskDir);
+ const env={HARNESS_SUPERVISOR_HOME:dir,ZCODE_PLUGIN_DATA:path.join(dir,"plugin"),HARNESS_SUPERVISOR_EVENT_SINK:"",HARNESS_SUPERVISOR_CONTEXT_FILE:""};
+ const first=JSON.parse(await runBridge({cwd:dir,session_id:"one",hook_event_name:"SessionStart"},env));
+ assert.match(first.hookSpecificOutput.additionalContext,/manual takeover/);
+ const second=JSON.parse(await runBridge({cwd:dir,session_id:"two",hook_event_name:"SessionStart"},env));
+ assert.deepEqual(second,{});
+ await runBridge({cwd:dir,session_id:"one",hook_event_name:"Stop",last_assistant_message:"done"},env);
+ const rows=(await fs.readFile(path.join(taskDir,"external-events.jsonl"),"utf8")).trim().split("\n").map(JSON.parse);
+ assert.deepEqual(rows.map(x=>x.payload.session_id),["one","one"]);
+ await unbindWorkspace(dir,task);
+});
+
+test('large Chinese context stays below the documented hook output limit', async (t) => {
+  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'hs-large-'));
+  t.after(()=>fs.rm(dir,{recursive:true,force:true}));
+  const context=path.join(dir,'context.md');
+  await fs.writeFile(context,'中文交接材料'.repeat(20000));
+  const output=await runBridge({hook_event_name:'SessionStart'}, {
+    HARNESS_SUPERVISOR_EVENT_SINK:path.join(dir,'events.jsonl'),HARNESS_SUPERVISOR_CONTEXT_FILE:context
+  });
+  assert.ok(Buffer.byteLength(output)<32768);
+  assert.match(JSON.parse(output).hookSpecificOutput.additionalContext,/context.md/);
+});

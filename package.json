@@ -4,9 +4,11 @@
   "private": true,
   "type": "module",
   "description": "Durable task handoff between native Codex and ZCode harnesses.",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check src/cli.mjs && node --check src/supervisor.mjs && node --check src/adapters/codex.mjs && node --check src/adapters/zcode.mjs && node --check zcode-plugin/hooks/bridge.mjs"
+    "check": "node scripts/check.mjs"
   }
 }

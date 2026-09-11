@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { resolveBinding } from "./bindings.mjs";
 
 const MAX_STRING = 80_000;
 const MAX_TRANSCRIPT = 1_000_000;
@@ -18,8 +19,15 @@ try {
 
 const payload = redact(input);
 const event = { at: new Date().toISOString(), source: "zcode-hook", payload };
+let binding = null;
+try {
+  if (!process.env.HARNESS_SUPERVISOR_EVENT_SINK) binding = await resolveBinding(input);
+} catch (error) { process.stderr.write(`[harness-supervisor] binding: ${error.message}\n`); }
 const sink = process.env.HARNESS_SUPERVISOR_EVENT_SINK
+  || (binding && path.join(binding.taskDir, "external-events.jsonl"))
   || path.join(process.env.ZCODE_PLUGIN_DATA || ".", "native-harness-events.jsonl");
+const contextFile = process.env.HARNESS_SUPERVISOR_CONTEXT_FILE
+  || (binding && path.join(binding.taskDir, "context.md"));
 
 try {
   await fs.mkdir(path.dirname(sink), { recursive: true });
@@ -30,13 +38,13 @@ try {
 }
 
 const hookName = input.hook_event_name ?? input.hookEventName;
-if (hookName === "SessionStart" && process.env.HARNESS_SUPERVISOR_CONTEXT_FILE) {
+if (hookName === "SessionStart" && contextFile) {
   try {
-    const context = await fs.readFile(process.env.HARNESS_SUPERVISOR_CONTEXT_FILE, "utf8");
+    const context = await fs.readFile(contextFile, "utf8");
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "SessionStart",
-        additionalContext: context.slice(0, 60_000),
+        additionalContext: boundedContext(context, contextFile),
       },
     }) + "\n");
     process.exit(0);
@@ -56,6 +64,11 @@ async function snapshotTranscript(value, eventSink) {
       const firstNewline = tail.indexOf("\n");
       text = firstNewline >= 0 ? tail.slice(firstNewline + 1) : tail;
     }
+    text = text.split("\n").map((line) => {
+      if (!line) return line;
+      try { return JSON.stringify(redact(JSON.parse(line))); }
+      catch { return redact(line); }
+    }).join("\n");
     const dir = path.join(path.dirname(eventSink), "native");
     await fs.mkdir(dir, { recursive: true });
     const safeSession = String(session).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120);
@@ -82,4 +95,13 @@ function redact(value, key = "") {
     );
   }
   return value;
+}
+
+function boundedContext(context, file) {
+  const prefix = `Takeover context file: ${file}\nRead this file for full task details before continuing.\n\n`;
+  let excerpt = context.slice(0, 20_000);
+  while (Buffer.byteLength(JSON.stringify(prefix + excerpt), "utf8") > 24_000) {
+    excerpt = excerpt.slice(0, Math.floor(excerpt.length * 0.8));
+  }
+  return prefix + excerpt;
 }

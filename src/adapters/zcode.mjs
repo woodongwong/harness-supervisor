@@ -8,7 +8,7 @@ export class ZCodeAdapter {
   constructor({ binary = process.env.ZCODE_BIN ?? "zcode", argsTemplate = null, resumeArgsTemplate = null, spawnImpl = nodeSpawn } = {}) {
     this.name = "zcode";
     this.binary = binary;
-    this.argsTemplate = argsTemplate ?? parseJsonArrayEnv("ZCODE_SUPERVISOR_ARGS_JSON", ["--prompt", "{prompt}"]);
+    this.argsTemplate = argsTemplate ?? parseJsonArrayEnv("ZCODE_SUPERVISOR_ARGS_JSON", []);
     this.resumeArgsTemplate = resumeArgsTemplate
       ?? (process.env.ZCODE_SUPERVISOR_RESUME_ARGS_JSON
         ? parseJsonArrayEnv("ZCODE_SUPERVISOR_RESUME_ARGS_JSON")
@@ -19,15 +19,16 @@ export class ZCodeAdapter {
   capabilities() {
     return {
       harness: this.name,
-      headless: true,
+      headless: this.argsTemplate.length > 0,
       structuredEvents: false,
-      resumeSession: Boolean(this.resumeArgsTemplate),
+      resumeSession: Boolean(this.resumeArgsTemplate?.length),
       nativeSessionId: true,
       hooks: true,
     };
   }
 
-  async run({ task, prompt, resumeSessionId = null, onEvent = async () => {}, taskDir, contextPath, externalEventsPath }) {
+  async run({ task, prompt, resumeSessionId = null, onEvent = async () => {}, taskDir, contextPath, externalEventsPath, signal }) {
+    if (!this.argsTemplate.length) throw new Error("ZCode has no configured launcher; prepare a manual handoff instead.");
     if (resumeSessionId && !this.resumeArgsTemplate) {
       throw new Error("ZCode resume is not configured. Set ZCODE_SUPERVISOR_RESUME_ARGS_JSON if your launcher exposes resume.");
     }
@@ -54,6 +55,7 @@ export class ZCodeAdapter {
       env,
       spawnImpl: this.spawnImpl,
       parseJsonLines: false,
+      signal,
       onNativeEvent: async (event) => onEvent({ type: "worker.native", harness: "zcode", payload: event }),
     });
 

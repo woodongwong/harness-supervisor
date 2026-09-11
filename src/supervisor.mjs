@@ -1,3 +1,4 @@
+import { assertWorkspaceUnbound } from "../zcode-plugin/hooks/bindings.mjs";
 import { CodexAdapter } from "./adapters/codex.mjs";
 import { ZCodeAdapter } from "./adapters/zcode.mjs";
 import { captureGitState } from "./git-state.mjs";
@@ -7,9 +8,10 @@ import { nowIso, truncate } from "./util.mjs";
 const RECOVERABLE = new Set(["quota", "auth", "transport", "process"]);
 
 export class HarnessSupervisor {
-  constructor({ store = new TaskStore(), adapters = null } = {}) {
+  constructor({ store = new TaskStore(), adapters = null, signal = null } = {}) {
     this.store = store;
     this.adapters = adapters ?? { codex: new CodexAdapter(), zcode: new ZCodeAdapter() };
+    this.signal = signal;
   }
 
   capabilities() {
@@ -29,24 +31,45 @@ export class HarnessSupervisor {
   }
 
   async run(taskId) {
-    const task = await this.store.require(taskId);
-    return await this.#runHarness(task, task.primary, { allowFallback: true });
+    return this.store.withTaskLock(taskId, async () => {
+      const task = await this.store.require(taskId);
+      if (task.status === "awaiting_manual") throw new Error("Manual handoff pending; use takeover explicitly after stopping that worker");
+      return this.#runHarness(task, task.owner ?? task.primary, { allowFallback: true });
+    });
   }
 
   async takeover(taskId, toHarness, feedback = "") {
-    const task = await this.store.require(taskId);
-    this.#adapter(toHarness);
-    await this.store.appendEvent(task.id, {
-      type: "task.takeover.requested",
-      from: task.owner,
-      to: toHarness,
-      feedback: truncate(feedback, 20_000),
+    return this.store.withTaskLock(taskId, async () => {
+      const task = await this.store.require(taskId);
+      this.#adapter(toHarness);
+      await this.store.appendEvent(task.id, {
+        type: "task.takeover.requested",
+        from: task.owner,
+        to: toHarness,
+        feedback: truncate(feedback, 20_000),
     });
     return await this.#runHarness(task, toHarness, { allowFallback: false, feedback });
+    });
   }
 
   async #runHarness(task, harness, { allowFallback, feedback = "" }) {
+    await assertWorkspaceUnbound(this.store.root, task.cwd);
     const adapter = this.#adapter(harness);
+    if (this.signal?.aborted) throw new Error("Cancelled before worker start");
+    if (!adapter.capabilities().headless) {
+      const prompt = await this.#buildHandoffPrompt(task, harness, feedback);
+      await this.store.writeContext(task.id, prompt);
+      task.owner = harness;
+      task.status = "awaiting_manual";
+      task.error = null;
+      await this.store.save(task);
+      await this.store.appendEvent(task.id, { type: "task.manual_handoff", harness });
+      return { task, result: {
+        exitCode: null, reason: "manual_handoff_required", sessionId: null,
+        output: `Open ${task.cwd} in ZCode and supply ${this.store.contextPath(task.id)}. Run bind-zcode ${task.id} before starting a new session to enable the bridge.`,
+        contextPath: this.store.contextPath(task.id),
+      } };
+    }
     task.owner = harness;
     task.status = "running";
     task.generation += 1;
@@ -83,7 +106,16 @@ export class HarnessSupervisor {
         taskDir: this.store.taskDir(task.id),
         contextPath: this.store.contextPath(task.id),
         externalEventsPath: this.store.externalEventsPath(task.id),
-        onEvent: async (event) => this.store.appendEvent(task.id, event),
+        signal: this.signal,
+        onEvent: async (event) => {
+          await this.store.appendEvent(task.id, event);
+          const id = event.payload?.type === "thread.started" ? event.payload.thread_id : null;
+          if (id) {
+            task.sessions[harness] = id;
+            attempt.sessionId = id;
+            await this.store.save(task);
+          }
+        },
       });
     } catch (error) {
       result = {
@@ -92,7 +124,7 @@ export class HarnessSupervisor {
         sessionId: attempt.sessionId,
         output: "",
         stderr: String(error?.stack ?? error),
-        reason: "process",
+        reason: error.code === "JOURNAL_FAILED" ? "journal" : "process",
       };
     }
 
@@ -120,7 +152,7 @@ export class HarnessSupervisor {
       return { task, result };
     }
 
-    task.status = result.reason === "quota" ? "worker_unavailable" : "failed";
+    task.status = result.reason === "cancelled" ? "cancelled" : result.reason === "quota" ? "worker_unavailable" : "failed";
     task.error = result.stderr || result.reason || `exit ${result.exitCode}`;
     await this.store.save(task);
 

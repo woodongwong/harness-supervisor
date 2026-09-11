@@ -16,7 +16,10 @@ export class TaskStore {
     await fs.mkdir(this.tasksDir, { recursive: true });
   }
 
-  taskDir(id) { return path.join(this.tasksDir, id); }
+  taskDir(id) {
+    if (!/^task-[a-zA-Z0-9-]+$/.test(id)) throw new Error("Invalid task id");
+    return path.join(this.tasksDir, id);
+  }
   statePath(id) { return path.join(this.taskDir(id), "task.json"); }
   eventsPath(id) { return path.join(this.taskDir(id), "events.jsonl"); }
   externalEventsPath(id) { return path.join(this.taskDir(id), "external-events.jsonl"); }
@@ -103,6 +106,45 @@ export class TaskStore {
 
   async writeContext(id, text) {
     await fs.writeFile(this.contextPath(id), String(text), "utf8");
+  }
+
+  async withTaskLock(id, fn) {
+    const task = await this.require(id);
+    const cwd = await fs.realpath(task.cwd);
+    const dir = path.join(this.root, "locks");
+    await fs.mkdir(dir, { recursive: true });
+    const key = crypto.createHash("sha256").update(cwd).digest("hex");
+    const file = path.join(dir, `${key}.lock`);
+    let handle;
+    try { handle = await fs.open(file, "wx", 0o600); }
+    catch (error) {
+      if (error.code === "EEXIST") throw new Error(`Workspace is locked. Inspect ${file}; use unlock ${id} only after its worker has stopped.`);
+      throw error;
+    }
+    try {
+      await handle.writeFile(JSON.stringify({ pid: process.pid, taskId: id, cwd }));
+      return await fn();
+    } finally {
+      await handle.close();
+      await fs.unlink(file);
+    }
+  }
+
+  async unlock(id) {
+    const task = await this.require(id);
+    const cwd = await fs.realpath(task.cwd);
+    const key = crypto.createHash("sha256").update(cwd).digest("hex");
+    const file = path.join(this.root, "locks", `${key}.lock`);
+    const owner = JSON.parse(await fs.readFile(file, "utf8"));
+    if (owner.taskId !== id) throw new Error(`Lock belongs to ${owner.taskId}`);
+    if (!Number.isInteger(owner.pid) || owner.pid <= 0) throw new Error("Invalid lock PID; inspect lock manually");
+    try { process.kill(owner.pid, 0); }
+    catch (error) {
+      if (error.code !== "ESRCH") throw error;
+      await fs.unlink(file);
+      return;
+    }
+    throw new Error(`Supervisor ${owner.pid} is still running; refusing to unlock`);
   }
 
   async #enqueue(id, fn) {

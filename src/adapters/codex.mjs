@@ -21,7 +21,7 @@ export class CodexAdapter {
     };
   }
 
-  async run({ task, prompt, resumeSessionId = null, onEvent = async () => {} }) {
+  async run({ task, prompt, resumeSessionId = null, onEvent = async () => {}, signal }) {
     const args = resumeSessionId
       ? ["exec", "--json", ...this.extraArgs, "resume", resumeSessionId, prompt]
       : ["exec", "--json", ...this.extraArgs, prompt];
@@ -33,12 +33,14 @@ export class CodexAdapter {
       env: process.env,
       spawnImpl: this.spawnImpl,
       parseJsonLines: true,
+      signal,
       onNativeEvent: async (event) => onEvent({ type: "worker.native", harness: "codex", payload: event }),
     });
   }
 }
 
-export async function runChild({ binary, args, cwd, env, spawnImpl, parseJsonLines, onNativeEvent }) {
+export async function runChild({ binary, args, cwd, env, spawnImpl, parseJsonLines, onNativeEvent, signal }) {
+  if (signal?.aborted) return { exitCode: 130, reason: "cancelled", output: "", stderr: "Cancelled", sessionId: null };
   let child;
   try {
     child = spawnImpl(binary, args, {
@@ -46,6 +48,7 @@ export async function runChild({ binary, args, cwd, env, spawnImpl, parseJsonLin
       env,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
+      detached: process.platform !== "win32",
     });
   } catch (error) {
     return {
@@ -64,6 +67,24 @@ export async function runChild({ binary, args, cwd, env, spawnImpl, parseJsonLin
   let sessionId = null;
   const errors = [];
   const agentMessages = [];
+  let pending = Promise.resolve();
+  let journalError = null;
+  let sawFailedTurn = false;
+  let sawCompletedTurn = false;
+  let killTimer;
+  const kill = (sig) => {
+    try {
+      if (child.pid && process.platform !== "win32") process.kill(-child.pid, sig);
+      else child.kill?.(sig);
+    } catch (error) { if (error.code !== "ESRCH") child.kill?.(sig); }
+  };
+  const cancel = () => {
+    kill("SIGTERM");
+    killTimer = setTimeout(() => kill("SIGKILL"), 3000);
+    killTimer.unref();
+  };
+  signal?.addEventListener("abort", cancel, { once: true });
+  if (signal?.aborted) cancel();
 
   const consumeLine = async (line) => {
     if (!line.trim()) return;
@@ -71,18 +92,23 @@ export async function runChild({ binary, args, cwd, env, spawnImpl, parseJsonLin
       await onNativeEvent({ type: "stdout", text: truncate(line, 50_000) });
       return;
     }
-    try {
-      const event = JSON.parse(line);
-      if (event.type === "thread.started" && event.thread_id) sessionId = event.thread_id;
-      if (event.type === "turn.failed") errors.push(event?.error?.message ?? JSON.stringify(event));
-      if (event.type === "error") errors.push(event.message ?? JSON.stringify(event));
-      if (event.type === "item.completed" && event?.item?.type === "agent_message") {
-        agentMessages.push(String(event.item.text ?? ""));
-      }
-      await onNativeEvent(event);
-    } catch {
+    let event;
+    try { event = JSON.parse(line); }
+    catch {
       await onNativeEvent({ type: "stdout.unparsed", text: truncate(line, 50_000) });
+      return;
     }
+    if (event.type === "thread.started" && event.thread_id) sessionId = event.thread_id;
+    if (event.type === "turn.completed") sawCompletedTurn = true;
+    if (event.type === "turn.failed") {
+      sawFailedTurn = true;
+      errors.push(event?.error?.message ?? JSON.stringify(event));
+    }
+    if (event.type === "error") errors.push(event.message ?? JSON.stringify(event));
+    if (event.type === "item.completed" && event?.item?.type === "agent_message") {
+      agentMessages.push(String(event.item.text ?? ""));
+    }
+    await onNativeEvent(event);
   };
 
   child.stdout?.setEncoding?.("utf8");
@@ -95,7 +121,10 @@ export async function runChild({ binary, args, cwd, env, spawnImpl, parseJsonLin
     while ((idx = buffer.indexOf("\n")) >= 0) {
       const line = buffer.slice(0, idx);
       buffer = buffer.slice(idx + 1);
-      void consumeLine(line);
+      pending = pending.then(() => consumeLine(line)).catch((error) => {
+        journalError ??= error;
+        cancel();
+      });
     }
   });
   child.stderr?.on?.("data", (chunk) => {
@@ -112,10 +141,19 @@ export async function runChild({ binary, args, cwd, env, spawnImpl, parseJsonLin
       }
     };
     child.once?.("error", (error) => finish({ code: 127, signal: null, spawnError: error }));
-    child.once?.("exit", (code, signal) => finish({ code: code ?? 1, signal, spawnError: null }));
+    child.once?.("close", (code, signal) => finish({ code: code ?? 1, signal, spawnError: null }));
   });
 
-  if (buffer.trim()) await consumeLine(buffer);
+  clearTimeout(killTimer);
+  signal?.removeEventListener("abort", cancel);
+  await pending;
+  if (buffer.trim() && !journalError) {
+    try { await consumeLine(buffer); } catch (error) { journalError = error; }
+  }
+  clearTimeout(killTimer);
+  if (journalError) {
+    throw Object.assign(new Error(`Event journal failed: ${journalError.message}`), { code: "JOURNAL_FAILED" });
+  }
   const combined = [stderr, ...errors, result.spawnError?.message].filter(Boolean).join("\n");
 
   return {
@@ -124,7 +162,9 @@ export async function runChild({ binary, args, cwd, env, spawnImpl, parseJsonLin
     sessionId,
     output: agentMessages.at(-1) ?? truncate(stdout, 120_000),
     stderr: truncate(stderr, 120_000),
-    reason: classifyFailure(combined, result.code),
+    reason: signal?.aborted ? "cancelled"
+      : result.code === 0 && !sawFailedTurn && (sawCompletedTurn || errors.length === 0) ? null
+      : classifyFailure(combined, result.code) ?? "process",
     command: [binary, ...args],
   };
 }
