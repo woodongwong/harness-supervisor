@@ -1,0 +1,12 @@
+{
+  "description": "Harness Supervisor bridge",
+  "hooks": {
+    "SessionStart": [{ "matcher": "startup|clear|compact", "hooks": [{ "type": "process", "command": "node", "args": ["${ZCODE_PLUGIN_ROOT}/hooks/bridge.mjs"], "timeoutMs": 5000 }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "process", "command": "node", "args": ["${ZCODE_PLUGIN_ROOT}/hooks/bridge.mjs"], "timeoutMs": 5000 }] }],
+    "PreToolUse": [{ "matcher": "*", "hooks": [{ "type": "process", "command": "node", "args": ["${ZCODE_PLUGIN_ROOT}/hooks/bridge.mjs"], "timeoutMs": 5000 }] }],
+    "PermissionRequest": [{ "matcher": "*", "hooks": [{ "type": "process", "command": "node", "args": ["${ZCODE_PLUGIN_ROOT}/hooks/bridge.mjs"], "timeoutMs": 5000 }] }],
+    "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "process", "command": "node", "args": ["${ZCODE_PLUGIN_ROOT}/hooks/bridge.mjs"], "timeoutMs": 5000 }] }],
+    "PostToolUseFailure": [{ "matcher": "*", "hooks": [{ "type": "process", "command": "node", "args": ["${ZCODE_PLUGIN_ROOT}/hooks/bridge.mjs"], "timeoutMs": 5000 }] }],
+    "Stop": [{ "hooks": [{ "type": "process", "command": "node", "args": ["${ZCODE_PLUGIN_ROOT}/hooks/bridge.mjs"], "timeoutMs": 5000 }] }]
+  }
+}
