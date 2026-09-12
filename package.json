@@ -1,0 +1,14 @@
+{
+  "name": "harness-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Durable task handoff across native coding harnesses.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "check": "node scripts/check.mjs"
+  }
+}

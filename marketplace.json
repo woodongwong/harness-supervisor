@@ -1,0 +1,15 @@
+{
+  "name": "harness-relay",
+  "description": "Harness Relay ZCode integration marketplace",
+  "plugins": [
+    {
+      "name": "harness-relay-bridge",
+      "source": "./zcode-plugin",
+      "description": "Persist ZCode lifecycle events and inject takeover context for Harness Relay.",
+      "version": "0.1.0",
+      "category": "developer-tools",
+      "tags": ["harness", "handoff", "codex", "zcode"],
+      "strict": true
+    }
+  ]
+}
