@@ -10,6 +10,7 @@ import { HARNESS_INTEGRATIONS } from "./harness-integrations.mjs";
 import { mergeProgress, progressAssessment } from "./task-progress.mjs";
 import { taskIdentity, identityLine } from "./task-identity.mjs";
 import { fileURLToPath } from "node:url";
+import { stoppedPatchCalls } from "./tool-reconciliation.mjs";
 
 export async function autoDirectory(root, cwd) {
   const canonical = await fs.realpath(cwd);
@@ -140,6 +141,7 @@ export class AutoHandoff {
     const key = sessionKey(harness, input);
     const request = crypto.randomUUID();
     const deadline = Date.now() + this.waitMs;
+    let reconciliationAttempted = false;
     while (true) {
       const outcome = await transaction(dir, async () => {
         const file = path.join(dir, "state.json");
@@ -155,6 +157,10 @@ export class AutoHandoff {
           return { output: contextOutput(hook, `任务身份：${identityLine(identity)}\nTask ID: ${task.id}\n目录：${task.cwd}\n分支：${identity.branch ?? "未登记"}\n当前查看会话：${key}；执行权尚未因打开窗口而改变。首次回复用一行说明所属任务与目录；等待用户消息，不自行开始工作。`) };
         }
         if (hook === "UserPromptSubmit") {
+          if (!reconciliationAttempted) {
+            reconciliationAttempted = true;
+            if (await this.reconcileStoppedTools(state)) await write(file, state);
+          }
           if (state.pending && state.pending.expires < Date.now()) state.pending = null;
           if (state.pending && state.pending.request !== request) {
             return { output: denyHook(hook, "已有另一个会话等待交接；本次请求未取得执行权。") };
@@ -167,7 +173,10 @@ export class AutoHandoff {
             if (Date.now() >= deadline) {
               state.pending = null;
               await write(file, state);
-              return { output: denyHook(hook, "旧会话尚未确认停止，交接等待超时；本次消息未执行。旧会话结束后可再次发送普通消息。") };
+              const reason = !state.owner?.active && Object.keys(state.tools).length
+                ? `会话已停止，但仍有 ${Object.keys(state.tools).length} 个工具未确认结束；交接等待超时，本次消息未执行。需核对工具完成事件。`
+                : "旧会话尚未确认停止，交接等待超时；本次消息未执行。旧会话结束后可再次发送普通消息。";
+              return { output: denyHook(hook, reason) };
             }
             return { wait: true };
           }
@@ -233,6 +242,7 @@ export class AutoHandoff {
             };
           }
           state.owner.active = false;
+          if (hook === "Stop") await this.reconcileStoppedTools(state);
           const task = await this.store.require(state.taskId);
           task.status = Object.keys(state.tools).length ? "waiting_tools" : "idle";
           await this.store.save(task);
@@ -250,6 +260,35 @@ export class AutoHandoff {
       if (!outcome.wait) return outcome.output;
       await delay(100);
     }
+  }
+
+  async reconcileStoppedTools(state) {
+    if (!state.taskId || state.owner?.active || !Object.keys(state.tools).length) return false;
+    const events = await this.store.readEvents(state.taskId, { limit: 200 });
+    const resolved = stoppedPatchCalls(state, events);
+    if (!resolved.length) return false;
+    await this.store.appendEvent(state.taskId, {
+      type: "task.tools_reconciled", sessionId: state.owner.sessionId,
+      turnId: state.owner.turnId, tools: resolved,
+    });
+    for (const tool of resolved) delete state.tools[tool.id];
+    const task = await this.store.require(state.taskId);
+    task.status = Object.keys(state.tools).length ? "waiting_tools" : "idle";
+    await this.store.save(task);
+    return true;
+  }
+
+  async reconcileTools(id) {
+    const task = await this.store.require(id);
+    const dir = await autoDirectory(this.store.root, task.cwd);
+    return transaction(dir, async () => {
+      const file = path.join(dir, "state.json");
+      const state = await read(file);
+      if (state?.taskId !== id || state.owner?.active || state.pending) throw new Error("任务仍在运行或等待交接，不能修复工具记录");
+      const changed = await this.reconcileStoppedTools(state);
+      if (changed) await write(file, state);
+      return { changed, remainingTools: Object.keys(state.tools).length };
+    });
   }
 
   progressCommand(task, owner) {
