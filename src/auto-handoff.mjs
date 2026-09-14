@@ -10,7 +10,8 @@ import { HARNESS_INTEGRATIONS } from "./harness-integrations.mjs";
 import { mergeProgress, progressAssessment } from "./task-progress.mjs";
 import { taskIdentity, identityLine } from "./task-identity.mjs";
 import { fileURLToPath } from "node:url";
-import { stoppedPatchCalls } from "./tool-reconciliation.mjs";
+import { stoppedPatchCalls, stoppedRejectedShellCalls } from "./tool-reconciliation.mjs";
+import { refreshPassiveCheckpoint } from "./passive-checkpoint.mjs";
 
 export async function autoDirectory(root, cwd) {
   const canonical = await fs.realpath(cwd);
@@ -186,12 +187,13 @@ export class AutoHandoff {
           }
           const task = await this.store.require(state.taskId);
           const previous = state.owner?.key ?? null;
+          const passive = await refreshPassiveCheckpoint(this.store, task.id);
           const promptAt = await this.record(task.id, harness, input);
           const events = await this.store.readEvents(task.id, { limit: 200 });
           state.checkpoints = completedTurns(events, state.checkpoints);
           const git = await captureGitState(state.cwd);
           const nextOwner = { key, harness, sessionId: input.session_id ?? input.sessionId, turnId: input.turn_id ?? null, active: true, prompt: redact(input.prompt ?? ""), startAt: promptAt, lease: crypto.randomUUID() };
-          const context = buildHandoffContext({ task, events, git, taskDir: this.store.taskDir(task.id), target: harness, auto: true, checkpoints: state.checkpoints,
+          const context = buildHandoffContext({ task, events, git, passive, taskDir: this.store.taskDir(task.id), target: harness, auto: true, checkpoints: state.checkpoints,
             identity: taskIdentity(task, { ...state, owner: nextOwner }),
             transition: previous !== key ? { from: state.owner?.harness ?? null, to: harness } : null,
             progressCommand: this.progressCommand(task, nextOwner) });
@@ -265,7 +267,7 @@ export class AutoHandoff {
   async reconcileStoppedTools(state) {
     if (!state.taskId || state.owner?.active || !Object.keys(state.tools).length) return false;
     const events = await this.store.readEvents(state.taskId, { limit: 200 });
-    const resolved = stoppedPatchCalls(state, events);
+    const resolved = [...stoppedPatchCalls(state, events), ...await stoppedRejectedShellCalls(state, events)];
     if (!resolved.length) return false;
     await this.store.appendEvent(state.taskId, {
       type: "task.tools_reconciled", sessionId: state.owner.sessionId,
@@ -288,6 +290,48 @@ export class AutoHandoff {
       const changed = await this.reconcileStoppedTools(state);
       if (changed) await write(file, state);
       return { changed, remainingTools: Object.keys(state.tools).length };
+    });
+  }
+
+  // Explicit recovery for a conversation that predates workspace registration.
+  // This imports source statements, not synthetic hooks or execution ownership.
+  async importCompletedHandoff({ cwd, goal, checkpoint, sourcePath, sourceText }) {
+    if (!checkpoint || !Object.hasOwn(HARNESS_INTEGRATIONS, checkpoint.harness)
+      || !checkpoint.sessionId || !checkpoint.turnId || checkpoint.ended !== true
+      || !Number.isFinite(Date.parse(checkpoint.at)) || !Number.isFinite(Date.parse(checkpoint.startAt))
+      || Date.parse(checkpoint.startAt) > Date.parse(checkpoint.at)
+      || typeof checkpoint.request !== "string" || typeof checkpoint.reply !== "string"
+      || typeof goal !== "string" || !goal.trim() || typeof sourceText !== "string"
+      || typeof sourcePath !== "string" || !path.isAbsolute(sourcePath)) {
+      throw new Error("导入需要已结束轮次的请求、回复、来源及时间记录");
+    }
+    const canonical = await fs.realpath(cwd);
+    const existing = await resolveAutoDirectory(this.store.root, canonical);
+    if (existing) throw new Error("此目录已登记任务；不能用历史导入覆盖现有交接");
+    await enableWorkspace(this.store.root, canonical);
+    const dir = await autoDirectory(this.store.root, canonical);
+    return transaction(dir, async () => {
+      const file = path.join(dir, "state.json");
+      const state = await read(file);
+      if (state.taskId || state.owner || state.pending || state.closed || Object.keys(state.tools).length) {
+        throw new Error("目录已开始工作；不能导入历史会话");
+      }
+      const task = await this.store.create({ goal, cwd: canonical, primary: checkpoint.harness });
+      const sourceFile = path.join(this.store.taskDir(task.id), "imported-handoff.md");
+      await fs.writeFile(sourceFile, sourceText, { mode: 0o600, flag: "wx" });
+      const imported = { ...redact(checkpoint), imported: true, sourcePath, sourceFile };
+      state.taskId = task.id;
+      state.checkpoints = { [checkpoint.harness]: imported };
+      task.status = "idle";
+      task.sessions[checkpoint.harness] = checkpoint.sessionId;
+      await this.store.appendEvent(task.id, { type: "task.handoff_imported", checkpoint: imported, sourcePath, sourceFile });
+      await this.store.save(task);
+      const context = buildHandoffContext({ task, events: [], git: await captureGitState(canonical),
+        taskDir: this.store.taskDir(task.id), auto: true, checkpoints: state.checkpoints,
+        identity: taskIdentity(task, state) });
+      await this.store.writeContext(task.id, context);
+      await write(file, state);
+      return { taskId: task.id, cwd: canonical, contextPath: this.store.contextPath(task.id), sourceFile };
     });
   }
 
@@ -339,7 +383,8 @@ export class AutoHandoff {
       if (state.owner?.active || state.pending || Object.keys(state.tools).length) throw new Error("任务仍在运行或等待交接，不能重建摘要");
       const task = await this.store.require(id);
       const [events, git] = await Promise.all([this.store.readEvents(id, { limit: 200 }), captureGitState(task.cwd)]);
-      const context = buildHandoffContext({ task, events, git, taskDir: this.store.taskDir(id), auto: true, checkpoints: state.checkpoints, identity: taskIdentity(task, state) });
+      const passive = await refreshPassiveCheckpoint(this.store, id);
+      const context = buildHandoffContext({ task, events, git, passive, taskDir: this.store.taskDir(id), auto: true, checkpoints: state.checkpoints, identity: taskIdentity(task, state) });
       const file = this.store.contextPath(id);
       const backup = `${file}.backup-${crypto.randomUUID()}`;
       await fs.copyFile(file, backup, fs.constants.COPYFILE_EXCL);
@@ -357,6 +402,7 @@ export class AutoHandoff {
       payload.handoff_content_omitted = true;
     }
     await fs.appendFile(this.store.externalEventsPath(id), JSON.stringify({ at, source: `${harness}-hook`, payload }) + "\n", { mode: 0o600 });
+    await refreshPassiveCheckpoint(this.store, id);
     const transcript = input.transcript_path ?? input.transcriptPath;
     if (transcript) {
       try {

@@ -1,6 +1,7 @@
 import { completedTurns, selectPreviousTurn, turnEvents } from "./turn-checkpoint.mjs";
 import { hasPendingWork, orderedProgressItems, progressAssessment } from "./task-progress.mjs";
 import { identityLine } from "./task-identity.mjs";
+import { passiveSummary } from "./passive-checkpoint.mjs";
 
 export const MAX_CONTEXT_BYTES = 8192;
 
@@ -67,7 +68,7 @@ function exitCode(response) {
 function progressSummary(progress, command) {
   const assessment = progressAssessment(progress);
   const unknown = "当前记录未提供完整待办依据；即使旧回复声称没有遗留待办，也不能据此确认历史待办为空。无需为普通问答额外审计。";
-  if (assessment === "uninitialized") return `尚未建立结构化任务状态。${unknown}开发过程中按 Skill 保存明确目标、约束和待办。`;
+  if (assessment === "uninitialized") return `尚未建立结构化任务状态。${unknown}交接依靠被动检查点；agent 可选补充明确目标、约束和待办。`;
   const items = orderedProgressItems(progress);
   const lines = [];
   let bytes = 0;
@@ -83,7 +84,7 @@ function progressSummary(progress, command) {
   return `版本：${progress.revision}；${conclusion}。这是 agent 的明确记录，并非独立验收。\n${progress.goal ? `持续目标：${text(progress.goal, 450)}\n` : ""}${lines.join("\n") || "尚无事项。"}${omitted ? `\n另有 ${omitted} 项未在摘要展开；${command ? "执行下方 task-state 读取命令获取完整状态" : "按需读取 task.json 中 progress 字段"}，不能据节选判定全部完成。` : ""}`;
 }
 
-export function buildHandoffContext({ task, events, git, taskDir, target = task.owner, feedback = "", auto = false, checkpoints = {}, identity, transition, progressCommand, generatedAt = new Date().toISOString() }) {
+export function buildHandoffContext({ task, events, git, taskDir, target = task.owner, feedback = "", auto = false, checkpoints = {}, passive, identity, transition, progressCommand, generatedAt = new Date().toISOString() }) {
   const currentPrompt = [...events].reverse().find(e => (e.payload?.hook_event_name ?? e.payload?.hookEventName) === "UserPromptSubmit")?.payload?.prompt;
   const previousTurn = selectPreviousTurn(events, target, checkpoints);
   // A missing explicitly requested source must not fall back to another harness.
@@ -136,16 +137,17 @@ export function buildHandoffContext({ task, events, git, taskDir, target = task.
     `## 当前请求\n${clip([narrative(currentPrompt || feedback || task.goal, 850), feedback ? narrative(feedback, 400) : ""].filter(Boolean).join("\n"), compact ? 600 : 1100)}`,
     ...(identity ? [`## 生成时任务身份\n${text(identityLine(identity), 230)}\nTask ID: ${text(task.id, 100)}；会话：${text(identity.owner?.sessionId ?? "尚未认领", 100)}\n目录：${text(identity.cwd, 350)}\n登记分支：${text(identity.branch ?? "未登记 worktree 分支", 120)}${transition ? `\n${transition.from ? `交接：${text(transition.from, 40)} → ${text(transition.to, 40)}` : "首次认领任务"}。本轮回复开头用一行说明任务名、worktree 和执行者。` : ""}`] : []),
     ...(task.worktree ? [`## 本 worktree 的任务目标\n${narrative(task.progress?.goal ?? task.goal, compact ? 300 : 650)}`] : []),
+    ...(passive?.turns?.length ? [`## 被动进展（无需 agent 主动保存）\n${clip(passiveSummary(passive), 1900)}\n完整检查点：${text(taskDir, 500)}/passive.json；这里只描述已观察事实，不赋予执行权。`] : []),
     `## 持续任务状态（跨轮次保留）\n${progressSummary(task.progress, progressCommand)}`,
-    ...(progressCommand ? [`## 状态更新入口（由 agent 使用）\n开发待办或验证状态变化时，结束本轮前按 Skill 增量保存；普通问答不清空旧事项。读：\n${progressCommand.read}\n写：\n${progressCommand.update}\n租约仅属于生成时的活动轮次，结束或交接后失效；从磁盘重读旧摘要不会获得写入权。每次成功后使用返回的新版本；失败不声称已保存，不绕过交接锁。`] : []),
-    `## 上一相关会话\n来源：${text(previousTurn?.harness ?? "未记录", 40)}；会话：${text(previousTurn?.sessionId ?? "未知", 120)}\n请求：${narrative(previousTurn?.request || (!previousTurn ? task.goal : "该轮请求未保留，请勿用旧任务目标替代"), compact ? 500 : 850)}\n轮次状态：${previousTurn?.ended ? "已收到 Stop；" + (previousTurn.reply ? "最终回复已记录" : "未记录最终回复") : "没有已结束轮次的记录"}。轮次结束不等于整个开发任务验收通过。`,
+    ...(progressCommand ? [`## 状态更新入口（由 agent 使用）\n可选增强：明确决策或待办需要长期保留时才使用；正常交接无需调用，也无需为此创建临时 JSON。普通问答不清空旧事项。读：\n${progressCommand.read}\n写：\n${progressCommand.update}\n租约仅属于生成时的活动轮次，结束或交接后失效；从磁盘重读旧摘要不会获得写入权。每次成功后使用返回的新版本；失败不声称已保存，不绕过交接锁。`] : []),
+    `## 上一相关会话\n来源：${text(previousTurn?.harness ?? "未记录", 40)}；会话：${text(previousTurn?.sessionId ?? "未知", 120)}\n请求：${narrative(previousTurn?.request || (!previousTurn ? task.goal : "该轮请求未保留，请勿用旧任务目标替代"), compact ? 500 : 850)}\n轮次状态：${previousTurn?.ended ? (previousTurn.imported ? "已导入原生会话结束记录；" : "已收到 Stop；") + (previousTurn.reply ? "最终回复已记录" : "未记录最终回复") : "没有已结束轮次的记录"}。轮次结束不等于整个开发任务验收通过。`,
     `## 上一轮回复（原会话陈述，非独立核验结论）\n${previousReply}`,
     `## 续接判断\n${hasPendingWork(task.progress) ? "持续任务状态仍有待办；上一轮问答完成不代表开发完成。用户要求继续任务时承接这些待办；若只问进展则说明状态，不擅自扩大工作。" : "若上一请求是普通问答且上方已有回答，简短说明已回答并承接新问题；不凭“继续”创建额外开发或核验任务。"}开发任务按明确待办继续，必要时核对相关文件和测试。`,
     `## 本轮执行记录（非历史审计清单）\n${recent(operations, 3, 850, "没有命令退出码记录。")}`,
     ...(failures.length ? [`## 本轮失败记录\n${recent(failures, 2, 450, "")}`] : []),
     `## 本轮文件变更记录\n${recent(changes, 3, 400, "没有显式文件写入事件；不据此断言工作目录从未变化。")}`,
     `## 工作区概况（独立于本轮工作）\n${clip(gitSummary, 650)}`,
-    `## 仅在必要时查证\n日志目录：${text(taskDir, 500)}\n本摘要已注入，无需再读 context.md。若确有具体问题，按上方会话标识定向查该会话记录；不要依次遍历全部转录、事件和旧摘要。无需为一般续接展示审计时间线。`,
+    `## 仅在必要时查证\n日志目录：${text(taskDir, 500)}${previousTurn?.imported ? `\n历史补录原文：${text(previousTurn.sourceFile, 500)}（原会话陈述，未重新执行或验证）` : ""}\n本摘要已注入，无需再读 context.md。若确有具体问题，按上方会话标识定向查该会话记录；不要依次遍历全部转录、事件和旧摘要。无需为一般续接展示审计时间线。`,
   ];
   const footer = parts.pop() + "\n";
   return clip(parts.join("\n\n"), MAX_CONTEXT_BYTES - Buffer.byteLength(footer) - 2) + "\n\n" + footer;
