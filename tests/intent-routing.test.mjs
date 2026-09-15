@@ -37,12 +37,18 @@ test("another window can ask and answer without interrupting active work or alte
   assert.deepEqual(next,{});
 });
 
-test("undecided and side turns cannot run tools; exact internal route commands are permitted",async t=>{
+test("undecided and side turns allow equivalent static route argv but reject shell features",async t=>{
   const f=await fixture(t);await f.send("b","UserPromptSubmit",{prompt:"Explain this"});
   const command=f.router.commands(await f.route("b")).side;
   assert.deepEqual(await f.send("b","PreToolUse",{tool_name:"Bash",tool_use_id:"control",tool_input:{command}}),{});
+  const modelNormalized=command.replace(/^'([^']+)'/,"$1");
+  assert.deepEqual(await f.send("b","PreToolUse",{tool_name:"Bash",tool_use_id:"normalized",tool_input:{command:modelNormalized}}),{});
   const bad=await f.send("b","PreToolUse",{tool_name:"Bash",tool_use_id:"bad",tool_input:{command:command+"; echo bypass"}});
   assert.equal(bad.hookSpecificOutput.permissionDecision,"deny");
+  for(const suffix of [" | cat"," > /tmp/out"," $(echo bypass)"," `echo bypass`"," && true"]) {
+    const denied=await f.send("b","PreToolUse",{tool_name:"Bash",tool_use_id:`bad-${suffix}`,tool_input:{command:command+suffix}});
+    assert.equal(denied.hookSpecificOutput.permissionDecision,"deny");
+  }
   assert.equal((await f.send("b","PreToolUse",{turn_id:undefined,tool_name:"Bash",tool_use_id:"no-turn",tool_input:{command}})).hookSpecificOutput.permissionDecision,"deny");
   assert.equal((await f.send("b","PreToolUse",{tool_name:"Bash",tool_input:{command}})).hookSpecificOutput.permissionDecision,"deny");
   await f.decide("b","side");

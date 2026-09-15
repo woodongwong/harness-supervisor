@@ -16,6 +16,52 @@ async function save(file, value) {
   await fs.rename(tmp, file);
 }
 
+// Parse only a single static shell command. This deliberately rejects every
+// shell feature that could add commands or change argv at execution time.
+// Quote spelling may differ because models commonly remove redundant quotes.
+function staticArgv(command) {
+  if (typeof command !== "string" || !command.trim()) return null;
+  const argv = [];
+  let value = "", started = false, quoting = null;
+  const unsafe = /[;&|<>()`$#\r\n*?\[\]{}~!]/;
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (quoting === "single") {
+      if (char === "'") quoting = null;
+      else value += char;
+      continue;
+    }
+    if (quoting === "double") {
+      if (char === '"') { quoting = null; continue; }
+      if (char === "\\") {
+        const next = command[++i];
+        if (next === undefined || next === "\n" || next === "\r") return null;
+        value += next; continue;
+      }
+      if (/[`$\r\n]/.test(char)) return null;
+      value += char; continue;
+    }
+    if (/\s/.test(char)) {
+      if (started) { argv.push(value); value = ""; started = false; }
+      continue;
+    }
+    if (char === "'") { quoting = "single"; started = true; continue; }
+    if (char === '"') { quoting = "double"; started = true; continue; }
+    if (char === "\\") {
+      const next = command[++i];
+      if (next === undefined || next === "\n" || next === "\r") return null;
+      value += next; started = true; continue;
+    }
+    if (unsafe.test(char)) return null;
+    value += char; started = true;
+  }
+  if (quoting) return null;
+  if (started) argv.push(value);
+  return argv;
+}
+
+const sameArgv = (left, right) => left?.length === right.length && right.every((value, i) => left[i] === value);
+
 // The native model classifies intent. Hooks never classify free text with
 // keyword heuristics or silently treat every new message as a takeover.
 export class IntentRouting {
@@ -28,11 +74,18 @@ export class IntentRouting {
     await fs.mkdir(dir, { recursive: true });
     return dir;
   }
-  commands(route) {
+  commandArgv(route, mode) {
     const cli = fileURLToPath(new URL("./cli.mjs", import.meta.url));
+    return [process.execPath, cli, "route", "--root", this.store.root, "--cwd", route.input.cwd,
+      "--harness", route.harness, "--session", route.input.session_id, "--ticket", route.ticket, "--mode", mode];
+  }
+  commands(route) {
     return Object.fromEntries(["side", "continue", "new"].map(mode => [mode,
-      [process.execPath, cli, "route", "--root", this.store.root, "--cwd", route.input.cwd,
-        "--harness", route.harness, "--session", route.input.session_id, "--ticket", route.ticket, "--mode", mode].map(quote).join(" ")]));
+      this.commandArgv(route, mode).map(quote).join(" ")]));
+  }
+  matchesCommand(route, command) {
+    const actual = staticArgv(command);
+    return ["side", "continue", "new"].some(mode => sameArgv(actual, this.commandArgv(route, mode)));
   }
   async handle(harness, raw) {
     const state = raw.cwd ? await autoStatus(this.store.root, raw.cwd) : null;
@@ -88,7 +141,7 @@ export class IntentRouting {
       if (["PreToolUse", "PermissionRequest"].includes(hook)) {
         if (hook === "PreToolUse" && !id) return denyHook(hook, "工具事件缺少调用编号，不能跟踪内部路由。");
         const command = input.tool_input?.command;
-        if (input.tool_name === "Bash" && typeof command === "string" && Object.values(this.commands(route)).includes(command)) {
+        if (input.tool_name === "Bash" && this.matchesCommand(route, command)) {
           if (hook === "PreToolUse" && id && !route.controls.includes(id)) { route.controls.push(id); await save(file, route); }
           return {};
         }
