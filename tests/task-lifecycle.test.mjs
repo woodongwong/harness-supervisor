@@ -8,7 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { TaskStore } from "../src/store.mjs";
 import { WorktreeTasks } from "../src/worktree-tasks.mjs";
 import { TaskJobs, readJob, activeJob, jobLaunch } from "../src/task-jobs.mjs";
-import { AutoHandoff, autoStatus } from "../src/auto-handoff.mjs";
+import { AutoHandoff, autoStatus, enableWorkspace } from "../src/auto-handoff.mjs";
 import { integrateTask, planFinish } from "../src/task-integrate.mjs";
 
 const git=(cwd,...args)=>execFileSync("git",["-C",cwd,...args],{encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
@@ -68,6 +68,25 @@ test("dirty target and stale commits are refused before source closure",async t=
  const f=await prepared(t);await fs.writeFile(path.join(f.repo,"unrelated.txt"),"keep");await assert.rejects(integrateTask(f.store,f.task.id,f.opts),/未提交/);
  assert.equal((await autoStatus(f.store.root,f.task.cwd)).closed,undefined);
  await fs.unlink(path.join(f.repo,"unrelated.txt"));await assert.rejects(integrateTask(f.store,f.task.id,{...f.opts,targetCommit:f.opts.sourceCommit}),/变化/);
+});
+test("a destination lease fences a stopped source session that omitted Stop",async t=>{
+ const f=await prepared(t),auto=new AutoHandoff({root:f.store.root});
+ await auto.handle("codex",{cwd:f.task.cwd,session_id:"source",turn_id:"source-turn",hook_event_name:"UserPromptSubmit",prompt:"prepare feature"});
+ await enableWorkspace(f.store.root,f.repo);
+ await auto.handle("codex",{cwd:f.repo,session_id:"target",turn_id:"target-turn",hook_event_name:"UserPromptSubmit",prompt:"merge feature"});
+ const dest=await autoStatus(f.store.root,f.repo);
+ const result=await integrateTask(f.store,f.task.id,{...f.opts,lease:dest.owner.lease});
+ assert.equal(result.status,"verified");
+ const source=await autoStatus(f.store.root,f.task.cwd);
+ assert.equal(source.closed,true);assert.equal(source.owner.active,false);assert.ok(source.owner.fencedAt);
+ const denied=await auto.handle("codex",{cwd:f.task.cwd,session_id:"source",turn_id:"source-turn",hook_event_name:"PreToolUse",tool_name:"Bash",tool_use_id:"late"});
+ assert.equal(denied.hookSpecificOutput.permissionDecision,"deny");
+});
+test("an active source cannot be fenced without an active destination lease",async t=>{
+ const f=await prepared(t),auto=new AutoHandoff({root:f.store.root});
+ await auto.handle("codex",{cwd:f.task.cwd,session_id:"source",turn_id:"source-turn",hook_event_name:"UserPromptSubmit",prompt:"prepare feature"});
+ await assert.rejects(integrateTask(f.store,f.task.id,f.opts),/目标目录当前轮次租约/);
+ assert.equal((await autoStatus(f.store.root,f.task.cwd)).closed,undefined);
 });
 test("merge conflicts preserve both worktrees and unfinished merge",async t=>{
  const f=await fixture(t);await fs.writeFile(path.join(f.task.cwd,"file.txt"),"source\n");git(f.task.cwd,"commit","-qam","source");await fs.writeFile(path.join(f.repo,"file.txt"),"target\n");git(f.repo,"commit","-qam","target");

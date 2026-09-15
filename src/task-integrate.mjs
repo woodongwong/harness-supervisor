@@ -36,7 +36,12 @@ export async function integrateTask(store,id,{target,branch,sourceCommit,targetC
     if(dest.closed||dest.pending||(dest.owner?.active&&dest.owner.lease!==lease)
       ||(!dest.owner?.active&&Object.keys(dest.tools).length))throw new Error("目标目录仍被其他会话或工具占用");
     if(dest.taskId&&activeJob(await readJob(store,dest.taskId)))throw new Error("目标后台任务尚未结束");
-    await tasks.close(id);
+    const source=await autoStatus(store.root,task.cwd);
+    if(source?.owner?.active&&!dest.owner?.active)throw new Error("源会话尚未停止；仅持有目标目录当前轮次租约的会话可以封存它");
+    // A valid destination lease represents the active integration turn. If the
+    // source client omitted Stop but has no tools or pending handoff, close its
+    // gate while both directories are locked. Any later source tool is denied.
+    await tasks.close(id,{fenceActive:!!source?.owner?.active&&dest.owner?.active&&dest.owner.lease===lease});
     // Check again after fencing the source and acquiring the destination gate.
     await clean(task.cwd);await clean(target);
     if(await git(task.cwd,"branch","--show-current")!==task.worktree.branch||await git(target,"branch","--show-current")!==branch)throw new Error("准备期间分支发生变化");

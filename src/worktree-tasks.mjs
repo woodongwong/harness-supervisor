@@ -81,8 +81,8 @@ export class WorktreeTasks {
     return task;
   }
 
-  async close(id) {
-    return closeWorkspaceTask(this.store, await this.require(id));
+  async close(id, options) {
+    return closeWorkspaceTask(this.store, await this.require(id), options);
   }
 
   async location(id) {

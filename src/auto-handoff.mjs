@@ -96,21 +96,26 @@ async function resolveAutoDirectory(root, cwd) {
   }
 }
 
-export async function closeWorkspaceTask(store, task) {
+export async function closeWorkspaceTask(store, task, { fenceActive = false } = {}) {
   const dir = await autoDirectory(store.root, task.cwd);
   return transaction(dir, async () => {
     const file = path.join(dir, "state.json");
     const state = await read(file);
     if (state?.taskId !== task.id) throw new Error("任务与 worktree 记录不一致");
     if (activeJob(await readJob(store, task.id))) throw new Error("后台任务仍在运行，不能关闭");
-    if (state.owner?.active || state.pending || Object.keys(state.tools).length) throw new Error("任务仍在运行或等待交接，不能关闭");
+    if (state.pending || Object.keys(state.tools).length || (state.owner?.active && !fenceActive)) throw new Error("任务仍在运行或等待交接，不能关闭");
+    const fencedOwner = state.owner?.active ? { ...state.owner } : null;
     // Close the gate first so no new prompt can enter while the task is saved.
+    if (fencedOwner) state.owner = { ...state.owner, active: false, fencedAt: new Date().toISOString() };
     state.closed = true;
     await write(file, state);
     const latest = await store.require(task.id);
     latest.status = "archived";
     latest.closedAt ??= new Date().toISOString();
     await store.save(latest);
+    await store.appendEvent(task.id, { type: "task.closed", fencedOwner: fencedOwner ? {
+      harness: fencedOwner.harness, sessionId: fencedOwner.sessionId, turnId: fencedOwner.turnId,
+    } : null });
     return latest;
   });
 }
