@@ -88,14 +88,14 @@ export function rejectedShellCalls(state, events, transcript) {
   return resolved;
 }
 
-async function transcriptTail(file) {
+export async function transcriptTail(file, { maxBytes = 4 * 1024 * 1024 } = {}) {
   const handle = await fs.open(file, "r");
   try {
     const { size } = await handle.stat();
     const head = Buffer.alloc(Math.min(size, 256 * 1024));
     const first = await handle.read(head, 0, head.length, 0);
     const meta = JSON.parse(head.subarray(0, first.bytesRead).toString("utf8").split("\n")[0]);
-    const tail = Buffer.alloc(Math.min(size, 4 * 1024 * 1024));
+    const tail = Buffer.alloc(Math.min(size, maxBytes));
     const offset = size - tail.length;
     const last = await handle.read(tail, 0, tail.length, offset);
     const lines = tail.subarray(0, last.bytesRead).toString("utf8").split("\n");

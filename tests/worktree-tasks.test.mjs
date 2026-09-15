@@ -95,9 +95,9 @@ test("invalid base and non-repositories fail before creating task records", asyn
 test("open passes exact worktree directory to the client without starting a managed worker", async t => {
   const { repo, tasks } = await fixture(t);
   const task = await tasks.create({ repo, goal: "open" });
-  for (const harness of ["codex", "zcode"]) {
+  for (const harness of ["codex", "zcode", "codebuddy"]) {
     let invocation;
-    const result = await tasks.open(task.id, harness, { spawnImpl: (binary, args, options) => {
+    const result = await tasks.open(task.id, harness, { interactive: true, isTTY: true, spawnImpl: (binary, args, options) => {
       invocation = { binary, args, options };
       const child = new EventEmitter();
       setImmediate(() => child.emit("close", 0, null));
@@ -105,7 +105,7 @@ test("open passes exact worktree directory to the client without starting a mana
     } });
     assert.equal(result.code, 0);
     assert.equal(invocation.options.cwd, task.cwd);
-    assert.deepEqual(invocation.args, harness === "codex" ? ["-C", task.cwd] : [task.cwd]);
+    assert.deepEqual(invocation.args, harness === "codex" ? ["-C", task.cwd] : harness === "codebuddy" ? [] : [task.cwd]);
   }
 });
 
@@ -116,9 +116,56 @@ test("CLI creates, lists and locates the same registered worktree task", async t
   const created = run(["task-new", "--repo", repo, "--task", "CLI task", "--json"]);
   assert.equal(created.status, 0, created.stderr);
   const task = JSON.parse(created.stdout);
+  const plan = run(["task-open", task.id, "--in", "codex", "--json"]);
+  assert.equal(plan.status, 0, plan.stderr);
+  assert.equal(JSON.parse(plan.stdout).cwd, task.cwd);
+  assert.deepEqual(JSON.parse(plan.stdout).args, ["-C", task.cwd]);
+  const nested = run(["task-open", task.id, "--in", "codex", "--interactive"]);
+  assert.notEqual(nested.status, 0);
+  assert.match(nested.stderr, /交互客户端必须/);
   const listed = run(["task-list", "--repo", repo, "--json"]);
   assert.equal(JSON.parse(listed.stdout)[0].id, task.id);
   const location = run(["task-open", task.id]);
   assert.equal(location.stdout.trim(), task.cwd);
   assert.equal((await autoStatus(store.root, task.cwd)).taskId, task.id);
+});
+
+test("terminal launch returns on spawn without waiting for child close and preserves argv", async t => {
+  const { repo, tasks, store } = await fixture(t);
+  const task = await tasks.create({ repo, goal: "separate terminal" });
+  const before = await autoStatus(store.root, task.cwd);
+  let invocation, unref = false;
+  const result = await tasks.open(task.id, "codex", { terminalArgs: ["example-terminal", "--"], spawnImpl: (bin, args, opts) => {
+    invocation = { bin, args, opts };
+    const child = new EventEmitter();
+    child.unref = () => { unref = true; };
+    setImmediate(() => child.emit("spawn"));
+    return child;
+  } });
+  const plan = await tasks.launchPlan(task.id, "codex");
+  assert.equal(result.launched, true);
+  assert.equal(result.verifiedSession, false);
+  assert.equal(unref, true);
+  assert.deepEqual(invocation.args, ["--", plan.binary, ...plan.args]);
+  assert.equal(invocation.opts.cwd, task.cwd);
+  assert.equal(invocation.opts.detached, true);
+  assert.equal(invocation.opts.stdio, "ignore");
+  assert.deepEqual(await autoStatus(store.root, task.cwd), before);
+  await assert.rejects(tasks.open(task.id, "codex"), /交互客户端必须/);
+  await assert.rejects(tasks.open(task.id, "codex", { terminalArgs: [] }), /JSON/);
+  await assert.rejects(tasks.open(task.id, "codex", { terminalArgs: ["missing"], spawnImpl: () => {
+    const child = new EventEmitter(); setImmediate(() => child.emit("error", new Error("ENOENT"))); return child;
+  } }), /ENOENT/);
+});
+
+test("launch instructions quote paths with spaces and shell syntax literally", async t => {
+  const { dir, tasks } = await fixture(t);
+  const cwd = path.join(dir, "repo's $(false) space");
+  await fs.mkdir(cwd);
+  // launchPlan uses validated task identity; isolate shell quoting from Git setup.
+  tasks.location = async () => ({ id: "task-example", cwd });
+  const plan = await tasks.launchPlan("task-example", "codebuddy");
+  const cdPart = plan.command.slice(0, plan.command.indexOf(" && "));
+  const actual = execFileSync("bash", ["-c", `${cdPart} && pwd`], { encoding: "utf8" }).trim();
+  assert.equal(actual, cwd);
 });

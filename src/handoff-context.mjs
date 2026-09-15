@@ -140,7 +140,7 @@ export function buildHandoffContext({ task, events, git, taskDir, target = task.
     ...(passive?.turns?.length ? [`## 被动进展（无需 agent 主动保存）\n${clip(passiveSummary(passive), 1900)}\n完整检查点：${text(taskDir, 500)}/passive.json；这里只描述已观察事实，不赋予执行权。`] : []),
     `## 持续任务状态（跨轮次保留）\n${progressSummary(task.progress, progressCommand)}`,
     ...(progressCommand ? [`## 状态更新入口（由 agent 使用）\n可选增强：明确决策或待办需要长期保留时才使用；正常交接无需调用，也无需为此创建临时 JSON。普通问答不清空旧事项。读：\n${progressCommand.read}\n写：\n${progressCommand.update}\n租约仅属于生成时的活动轮次，结束或交接后失效；从磁盘重读旧摘要不会获得写入权。每次成功后使用返回的新版本；失败不声称已保存，不绕过交接锁。`] : []),
-    `## 上一相关会话\n来源：${text(previousTurn?.harness ?? "未记录", 40)}；会话：${text(previousTurn?.sessionId ?? "未知", 120)}\n请求：${narrative(previousTurn?.request || (!previousTurn ? task.goal : "该轮请求未保留，请勿用旧任务目标替代"), compact ? 500 : 850)}\n轮次状态：${previousTurn?.ended ? (previousTurn.imported ? "已导入原生会话结束记录；" : "已收到 Stop；") + (previousTurn.reply ? "最终回复已记录" : "未记录最终回复") : "没有已结束轮次的记录"}。轮次结束不等于整个开发任务验收通过。`,
+    `## 上一相关会话\n来源：${text(previousTurn?.harness ?? "未记录", 40)}；会话：${text(previousTurn?.sessionId ?? "未知", 120)}\n请求：${narrative(previousTurn?.request || (!previousTurn ? task.goal : "该轮请求未保留，请勿用旧任务目标替代"), compact ? 500 : 850)}\n轮次状态：${previousTurn?.ended ? (previousTurn.imported ? "已导入原生会话结束记录；" : previousTurn.nativeEnd ? "已核对原生 task_complete；" : "已收到 Stop；") + (previousTurn.reply ? "最终回复已记录" : "未记录最终回复") : "没有已结束轮次的记录"}。轮次结束不等于整个开发任务验收通过。`,
     `## 上一轮回复（原会话陈述，非独立核验结论）\n${previousReply}`,
     `## 续接判断\n${hasPendingWork(task.progress) ? "持续任务状态仍有待办；上一轮问答完成不代表开发完成。用户要求继续任务时承接这些待办；若只问进展则说明状态，不擅自扩大工作。" : "若上一请求是普通问答且上方已有回答，简短说明已回答并承接新问题；不凭“继续”创建额外开发或核验任务。"}开发任务按明确待办继续，必要时核对相关文件和测试。`,
     `## 本轮执行记录（非历史审计清单）\n${recent(operations, 3, 850, "没有命令退出码记录。")}`,

@@ -7,6 +7,9 @@ import { installAuto } from "./auto-install.mjs";
 import { autoStatus, AutoHandoff } from "./auto-handoff.mjs";
 import { WorktreeTasks } from "./worktree-tasks.mjs";
 import { workspaceStatus, formatWorkspaceStatus } from "./task-status.mjs";
+import { IntentRouting } from "./intent-routing.mjs";
+import { TaskJobs, readJob } from "./task-jobs.mjs";
+import { integrateTask, planFinish } from "./task-integrate.mjs";
 
 const controller = new AbortController();
 process.once("SIGINT", () => controller.abort());
@@ -30,15 +33,18 @@ function parse(argv) {
 }
 
 function usage() {
-  console.log(`harness-relay — 多 harness 任务交接（已接入 Codex / ZCode）
+  console.log(`harness-relay — 多 harness 任务交接（原生 Hook：Codex / ZCode / CodeBuddy CLI）
 
   run --cwd <项目目录> --task <任务> [--primary codex|zcode] [--fallback codex|zcode|none]
-  setup-auto --cwd <项目目录>  一次性接入 Codex / ZCode 的自动交接
+  setup-auto [--cwd <项目目录>] [--harness codex,zcode,codebuddy]  安装指定 Hook；省略目录只安装
   auto-status --cwd <项目目录> 查看当前会话、交接等待与工具状态
   task-new --repo <仓库> --task <目标> [--name <短名>] [--base <提交或分支>]
   task-list [--repo <仓库>] [--json]
-  task-open <task-id> [--in codex|zcode]  打开原生客户端；省略 --in 时显示目录
+  task-open <task-id> [--in codex|zcode|codebuddy] [--terminal|--interactive]  默认只显示启动命令
   task-close <task-id>     关闭空闲任务，保留 worktree、分支和记录
+  task-run <task-id> --in codex|codebuddy|zcode  后台执行已登记任务
+  task-job <task-id>       查看后台状态
+  task-integrate <task-id> --target <目录> --branch <分支> --source-commit <SHA> --target-commit <SHA> --verify-json <参数数组> [--cleanup] [--lease <目标轮次租约>]
   resume <task-id>
   takeover <task-id> --to codex|zcode [--feedback <说明>]
   bind-zcode <task-id>      绑定项目；随后在 ZCode 新建会话
@@ -81,7 +87,24 @@ try {
     timer.unref();
   }
   const worktrees = new WorktreeTasks({ store: supervisor.store });
-  if (command === "task-new") {
+  if(command==="task-run") {
+    const job=await new TaskJobs({store:supervisor.store}).start(values._[0],values.in);
+    const {token,launch,...visible}=job;console.log(JSON.stringify(visible,null,2));
+  } else if(command==="task-job") {
+    const job=await readJob(supervisor.store,values._[0]);
+    if(!job)throw new Error("没有后台任务记录");
+    const {token,launch,...visible}=job;console.log(JSON.stringify(visible,null,2));
+  } else if(command==="task-plan-finish") {
+    console.log(JSON.stringify(await planFinish(supervisor.store,values._[0],{target:values.target,branch:values.branch,
+      verify:JSON.parse(values['verify-json']),cleanup:!!values.cleanup}),null,2));
+  } else if(command==="task-integrate") {
+    console.log(JSON.stringify(await integrateTask(supervisor.store,values._[0],{target:values.target,branch:values.branch,
+      sourceCommit:values['source-commit'],targetCommit:values['target-commit'],verify:JSON.parse(values['verify-json']),
+      cleanup:!!values.cleanup,lease:values.lease}),null,2));
+  } else if (command === "route") {
+    for (const key of ["root", "cwd", "harness", "session", "ticket", "mode"]) if (typeof values[key] !== "string") throw new Error(`route requires --${key}`);
+    console.log(JSON.stringify(await new IntentRouting({root:values.root}).decide(values), null, 2));
+  } else if (command === "task-new") {
     if (typeof values.repo !== "string" || typeof values.task !== "string") throw new Error("task-new requires --repo and --task");
     const task = await worktrees.create({ repo: values.repo, goal: values.task, name: values.name ?? "task", base: values.base ?? "HEAD" });
     if (values.json) console.log(JSON.stringify(task, null, 2));
@@ -93,8 +116,17 @@ try {
   } else if (command === "task-open") {
     if (!values._[0]) throw new Error("task-open requires <task-id>");
     if (values.in) {
-      const result = await worktrees.open(values._[0], values.in);
-      process.exitCode = result.code;
+      if (values.terminal && values.interactive) throw new Error("--terminal 与 --interactive 不能同时使用");
+      if (values.terminal || values.interactive) {
+        if (values.terminal && !process.env.HARNESS_RELAY_TERMINAL_JSON) throw new Error("请设置 HARNESS_RELAY_TERMINAL_JSON 为终端启动器参数数组，或省略 --terminal 获取新终端中运行的命令。");
+        const result = await worktrees.open(values._[0], values.in, { interactive: !!values.interactive,
+          terminalArgs: values.terminal ? JSON.parse(process.env.HARNESS_RELAY_TERMINAL_JSON) : null });
+        if (result.launched) console.log("已发出独立终端启动请求；尚未验证客户端已就绪。请在新窗口确认工作目录后发送任务要求。");
+        process.exitCode = result.code;
+      } else {
+        const plan = await worktrees.launchPlan(values._[0], values.in);
+        console.log(values.json ? JSON.stringify(plan, null, 2) : `在新终端运行：\n${plan.command}\n\n当前会话的目录没有改变；启动后确认目录，再发送任务要求。`);
+      }
     } else {
       const task = await worktrees.location(values._[0]);
       console.log(values.json ? JSON.stringify(task, null, 2) : task.cwd);
@@ -104,10 +136,11 @@ try {
     const task = await worktrees.close(values._[0]);
     console.log(`任务已关闭：${task.id}\nworktree 和分支已保留：${task.cwd}\n${task.worktree.branch}\n可审查、测试后自行合并；此操作未合并或删除代码。`);
   } else if (command === "setup-auto") {
-    if (typeof values.cwd !== "string") throw new Error("setup-auto requires --cwd");
-    const result = await installAuto({ root: supervisor.store.root, cwd: values.cwd });
+    if (values.cwd !== undefined && typeof values.cwd !== "string") throw new Error("setup-auto requires a directory after --cwd");
+    if (values.harness !== undefined && typeof values.harness !== "string") throw new Error("setup-auto requires harness names after --harness");
+    const result = await installAuto({ root: supervisor.store.root, cwd: values.cwd, harnesses: values.harness?.split(",") });
     console.log(JSON.stringify(result, null, 2));
-    console.log("配置已保存。Codex 需在 /hooks 中一次性审阅并信任新 Hook；两端新建会话后，在该项目正常发送消息即可自动交接。");
+    console.log("配置已保存。Codex / CodeBuddy 请在 /hooks 中审阅新 Hook。新会话在已登记目录正常发送消息即可交接；未登记目录需另用 --cwd 启用。");
   } else if (command === "auto-status") {
     if (typeof values.cwd !== "string") throw new Error("auto-status requires --cwd");
     console.log(JSON.stringify(await autoStatus(supervisor.store.root, values.cwd), null, 2));

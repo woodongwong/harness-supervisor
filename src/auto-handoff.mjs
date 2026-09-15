@@ -6,12 +6,16 @@ import { TaskStore } from "./store.mjs";
 import { captureGitState } from "./git-state.mjs";
 import { buildHandoffContext, isContextRead } from "./handoff-context.mjs";
 import { completedTurns } from "./turn-checkpoint.mjs";
-import { HARNESS_INTEGRATIONS } from "./harness-integrations.mjs";
+import { HARNESS_INTEGRATIONS, normalizeHookInput } from "./harness-integrations.mjs";
 import { mergeProgress, progressAssessment } from "./task-progress.mjs";
 import { taskIdentity, identityLine } from "./task-identity.mjs";
 import { fileURLToPath } from "node:url";
 import { stoppedPatchCalls, stoppedRejectedShellCalls } from "./tool-reconciliation.mjs";
+import { readCodexToolCompletions } from "./codex-tool-completion.mjs";
 import { refreshPassiveCheckpoint } from "./passive-checkpoint.mjs";
+import { readCodeBuddyCancellations } from "./codebuddy-reconciliation.mjs";
+import { readCompletedCodexTurn } from "./codex-turn-reconciliation.mjs";
+import { activeJob, readJob } from "./task-jobs.mjs";
 
 export async function autoDirectory(root, cwd) {
   const canonical = await fs.realpath(cwd);
@@ -31,7 +35,7 @@ async function write(file, value) {
 
 // A short, cross-process transaction lock. Never reclaim a lock on a timer:
 // elapsed time does not prove the previous process stopped writing.
-async function transaction(dir, fn) {
+export async function transaction(dir, fn) {
   const lock = path.join(dir, "transaction.lock");
   let handle;
   const deadline = Date.now() + 1800;
@@ -98,6 +102,7 @@ export async function closeWorkspaceTask(store, task) {
     const file = path.join(dir, "state.json");
     const state = await read(file);
     if (state?.taskId !== task.id) throw new Error("任务与 worktree 记录不一致");
+    if (activeJob(await readJob(store, task.id))) throw new Error("后台任务仍在运行，不能关闭");
     if (state.owner?.active || state.pending || Object.keys(state.tools).length) throw new Error("任务仍在运行或等待交接，不能关闭");
     // Close the gate first so no new prompt can enter while the task is saved.
     state.closed = true;
@@ -133,11 +138,12 @@ export class AutoHandoff {
     this.waitMs = waitMs;
   }
 
-  async handle(harness, input) {
+  async handle(harness, input, { expectedOwner } = {}) {
     if (!Object.hasOwn(HARNESS_INTEGRATIONS, harness)) throw new Error("Unknown harness integration");
     if (!input.cwd || !(input.session_id ?? input.sessionId)) return null;
     const dir = await resolveAutoDirectory(this.store.root, input.cwd);
     if (!dir) return null;
+    input = normalizeHookInput(harness, input);
     const hook = hookName(input);
     const key = sessionKey(harness, input);
     const request = crypto.randomUUID();
@@ -147,9 +153,19 @@ export class AutoHandoff {
       const outcome = await transaction(dir, async () => {
         const file = path.join(dir, "state.json");
         const state = await read(file);
+        if (state.taskId && ["UserPromptSubmit", "PreToolUse", "PermissionRequest"].includes(hook)) {
+          const job = await readJob(this.store, state.taskId);
+          if (activeJob(job) && !(process.env.HARNESS_RELAY_JOB_TASK === state.taskId
+            && process.env.HARNESS_RELAY_JOB_TOKEN === job.token)) {
+            return { output: denyHook(hook, "此 worktree 正由后台任务执行，请等待该任务结束。") };
+          }
+        }
         if (state.closed) return { output: denyHook(hook, "此任务已关闭，请为新任务创建独立 worktree。") };
         const owns = state.owner?.key === key;
         const sameTurn = !input.turn_id || !state.owner?.turnId || input.turn_id === state.owner.turnId;
+        // SessionEnd in some CodeBuddy paths has no generation identity. It
+        // cannot establish which resumed turn ended, so never release on it.
+        if (harness === "codebuddy" && input.hook_event_name === "SessionEnd" && !input.turn_id) return { output: {} };
         // Opening a window or compacting a session must not steal execution.
         if (hook === "SessionStart") {
           if (!state.taskId) return { output: {} };
@@ -158,8 +174,15 @@ export class AutoHandoff {
           return { output: contextOutput(hook, `任务身份：${identityLine(identity)}\nTask ID: ${task.id}\n目录：${task.cwd}\n分支：${identity.branch ?? "未登记"}\n当前查看会话：${key}；执行权尚未因打开窗口而改变。首次回复用一行说明所属任务与目录；等待用户消息，不自行开始工作。`) };
         }
         if (hook === "UserPromptSubmit") {
+          if (expectedOwner && (state.taskId !== expectedOwner.taskId || (state.owner?.key ?? null) !== expectedOwner.key
+            || (state.owner?.turnId ?? null) !== expectedOwner.turnId)) {
+            return { output: denyHook(hook, "意图判断期间任务已变化，请重新判断后再接续。") };
+          }
           if (!reconciliationAttempted) {
             reconciliationAttempted = true;
+            if (await this.reconcileCodexTools(state)) await write(file, state);
+            if (await this.reconcileCodexTurn(state)) await write(file, state);
+            if (await this.reconcileCodeBuddyTools(state)) await write(file, state);
             if (await this.reconcileStoppedTools(state)) await write(file, state);
           }
           if (state.pending && state.pending.expires < Date.now()) state.pending = null;
@@ -278,6 +301,98 @@ export class AutoHandoff {
     task.status = Object.keys(state.tools).length ? "waiting_tools" : "idle";
     await this.store.save(task);
     return true;
+  }
+
+  async reconcileCodexTurn(state) {
+    if (!state.taskId || state.owner?.harness !== "codex") return false;
+    const checkpoint = state.checkpoints?.codex;
+    if (checkpoint?.nativeEnd && checkpoint.sessionId === state.owner.sessionId && checkpoint.turnId === state.owner.turnId) return false;
+    const events = await this.store.readEvents(state.taskId, { limit: 200 });
+    const completed = await readCompletedCodexTurn(state, events);
+    if (!completed) return false;
+    state.owner.active = false;
+    // Reuse only the synchronous-patch rule. A completed turn does not prove
+    // Bash or MCP background work has stopped. This local projection is never
+    // persisted as a fabricated Stop hook; the journal names the native source.
+    const resolved = stoppedPatchCalls(state, [...events, { at: completed.at, source: "codex-hook", payload: {
+      hook_event_name: "Stop", session_id: completed.sessionId, turn_id: completed.turnId,
+    } }]).filter(tool => {
+      const pre = events.findLast(e => e.source === "codex-hook" && e.payload?.session_id === completed.sessionId
+        && e.payload?.turn_id === completed.turnId && e.payload?.hook_event_name === "PreToolUse"
+        && (e.payload.tool_use_id ?? e.payload.toolUseId) === tool.id);
+      return Date.parse(pre?.at) <= Date.parse(completed.at);
+    }).map(tool => ({ ...tool, reason: "native_completed_synchronous_patch" }));
+    await this.store.appendEvent(state.taskId, { type: "task.native_turn_reconciled", ...completed, reply: redact(completed.reply), tools: resolved });
+    for (const tool of resolved) delete state.tools[tool.id];
+    state.checkpoints ??= {};
+    state.checkpoints.codex = { harness: "codex", sessionId: completed.sessionId, turnId: completed.turnId,
+      request: state.owner.prompt ?? "", startAt: state.owner.startAt, at: completed.at,
+      reply: redact(completed.reply), ended: true, nativeEnd: true };
+    const task = await this.store.require(state.taskId);
+    task.status = Object.keys(state.tools).length ? "waiting_tools" : "idle";
+    await this.store.save(task);
+    return true;
+  }
+
+  async reconcileNativeTurn(id) {
+    const task = await this.store.require(id);
+    const dir = await autoDirectory(this.store.root, task.cwd);
+    return transaction(dir, async () => {
+      const file = path.join(dir, "state.json");
+      const state = await read(file);
+      if (state?.taskId !== id || (state.pending && !(state.pending.expires < Date.now()))) throw new Error("任务已变化或正在交接，不能修复轮次记录");
+      const expiredPending = !!state.pending;
+      if (expiredPending) state.pending = null;
+      const toolsChanged = await this.reconcileCodexTools(state);
+      const turnChanged = await this.reconcileCodexTurn(state);
+      const changed = toolsChanged || turnChanged;
+      if (changed || expiredPending) await write(file, state);
+      return { changed, active: state.owner?.active, remainingTools: Object.keys(state.tools).length };
+    });
+  }
+
+  async reconcileCodexTools(state) {
+    if (!state.taskId || state.owner?.harness !== "codex" || !Object.keys(state.tools).length) return false;
+    const events = await this.store.readEvents(state.taskId, { limit: 200 });
+    const resolved = await readCodexToolCompletions(state, events);
+    if (!resolved.length) return false;
+    await this.store.appendEvent(state.taskId, { type: "task.tools_reconciled", sessionId: state.owner.sessionId,
+      turnId: state.owner.turnId, tools: resolved });
+    for (const tool of resolved) delete state.tools[tool.id];
+    const task = await this.store.require(state.taskId);
+    task.status = Object.keys(state.tools).length ? "waiting_tools" : state.owner.active ? "running" : "idle";
+    await this.store.save(task);
+    return true;
+  }
+
+  async reconcileCodeBuddyTools(state) {
+    if (!state.taskId || state.owner?.harness !== "codebuddy" || !Object.keys(state.tools).length) return false;
+    const events = await this.store.readEvents(state.taskId, { limit: 200 });
+    const resolved = await readCodeBuddyCancellations(state, events);
+    if (!resolved.length) return false;
+    await this.store.appendEvent(state.taskId, { type: "task.tools_reconciled", sessionId: state.owner.sessionId,
+      turnId: state.owner.turnId, tools: resolved });
+    for (const item of resolved) delete state.tools[item.id];
+    // Tool cancellation proves only that call did not execute. Keep an active
+    // owner fenced from OTHER sessions until an end event or same-session next
+    // prompt establishes a new turn. Never infer whole-turn completion here.
+    const task = await this.store.require(state.taskId);
+    task.status = Object.keys(state.tools).length ? "waiting_tools" : state.owner.active ? "running" : "idle";
+    await this.store.save(task);
+    return true;
+  }
+
+  async reconcileCancelledTools(id) {
+    const task = await this.store.require(id);
+    const dir = await autoDirectory(this.store.root, task.cwd);
+    return transaction(dir, async () => {
+      const file = path.join(dir, "state.json");
+      const state = await read(file);
+      if (state?.taskId !== id || state.pending) throw new Error("任务已变化或正在交接，不能修复工具记录");
+      const changed = await this.reconcileCodeBuddyTools(state);
+      if (changed) await write(file, state);
+      return { changed, remainingTools: Object.keys(state.tools).length };
+    });
   }
 
   async reconcileTools(id) {
@@ -426,7 +541,7 @@ export class AutoHandoff {
   }
 }
 
-function redact(value, key = "") {
+export function redact(value, key = "") {
   if (/api.?key|authorization|password|secret|access.?token|refresh.?token/i.test(key)) return "[REDACTED]";
   if (typeof value === "string") return value.replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]").replace(/\bsk-[\w-]{12,}\b/g, "[REDACTED]").slice(0, 15000);
   if (Array.isArray(value)) return value.slice(0, 100).map(v => redact(v));

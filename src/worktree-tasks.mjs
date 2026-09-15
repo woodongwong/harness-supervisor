@@ -8,6 +8,7 @@ import { newTaskId } from "./util.mjs";
 import { enableWorkspace, autoStatus, closeWorkspaceTask } from "./auto-handoff.mjs";
 
 const exec = promisify(execFile);
+const shellQuote = value => "'" + value.replaceAll("'", "'\\''") + "'";
 async function git(cwd, args) {
   try {
     const { stdout } = await exec("git", ["-C", cwd, ...args], { timeout: 30000, maxBuffer: 1024 * 1024 });
@@ -92,12 +93,33 @@ export class WorktreeTasks {
     return task;
   }
 
-  async open(id, harness, { spawnImpl = spawn } = {}) {
+  async launchPlan(id, harness) {
     const task = await this.location(id);
-    if (!["codex", "zcode"].includes(harness)) throw new Error("--in 只支持 codex 或 zcode");
+    if (!["codex", "zcode", "codebuddy"].includes(harness)) throw new Error("--in 只支持 codex、zcode 或 codebuddy");
     const binary = harness === "codex" ? (process.env.CODEX_BIN || "codex")
-      : (process.env.ZCODE_DESKTOP_BIN || (process.platform === "linux" ? "/opt/ZCode/zcode" : "zcode"));
-    const args = harness === "codex" ? ["-C", task.cwd] : [task.cwd];
+      : harness === "codebuddy" ? (process.env.CODEBUDDY_BIN || "codebuddy")
+        : (process.env.ZCODE_DESKTOP_BIN || (process.platform === "linux" ? "/opt/ZCode/zcode" : "zcode"));
+    const args = harness === "codex" ? ["-C", task.cwd] : harness === "codebuddy" ? [] : [task.cwd];
+    return { task, binary, args, cwd: task.cwd,
+      command: `cd ${shellQuote(task.cwd)} && ${[binary, ...args].map(shellQuote).join(" ")}` };
+  }
+
+  async open(id, harness, { spawnImpl = spawn, interactive = false, isTTY = process.stdin.isTTY && process.stdout.isTTY,
+    terminalArgs = null } = {}) {
+    const plan = await this.launchPlan(id, harness);
+    if (terminalArgs !== null) {
+      if (!Array.isArray(terminalArgs) || !terminalArgs.length || terminalArgs.some(s => typeof s !== "string" || !s)) {
+        throw new Error("终端启动器必须是非空 JSON 字符串数组");
+      }
+      return new Promise((resolve, reject) => {
+        const child = spawnImpl(terminalArgs[0], [...terminalArgs.slice(1), plan.binary, ...plan.args],
+          { cwd: plan.cwd, detached: true, stdio: "ignore", env: process.env });
+        child.once("error", reject);
+        child.once("spawn", () => { child.unref(); resolve({ task: plan.task, code: 0, launched: true, verifiedSession: false }); });
+      });
+    }
+    if (!interactive || !isTTY) throw new Error("交互客户端必须从用户终端显式使用 --interactive 启动；agent 请输出启动命令或使用 --terminal，不要等待嵌套会话退出。");
+    const { task, binary, args } = plan;
     return new Promise((resolve, reject) => {
       const child = spawnImpl(binary, args, { cwd: task.cwd, stdio: "inherit", env: process.env });
       child.once("error", reject);

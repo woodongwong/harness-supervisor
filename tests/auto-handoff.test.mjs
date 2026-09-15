@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { AutoHandoff, autoStatus, enableWorkspace } from "../src/auto-handoff.mjs";
 import { installAuto } from "../src/auto-install.mjs";
+import { IntentRouting } from "../src/intent-routing.mjs";
 
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hs-auto-"));
@@ -107,9 +108,18 @@ test("independent hook processes share the journal and only enabled projects par
   const { dir, root, input } = await fixture(t);
   const other = path.join(dir, "other"); await fs.mkdir(other);
   assert.deepEqual(await bridge(root, "codex", { cwd: other, session_id: "ignored", hook_event_name: "UserPromptSubmit" }), {});
-  await bridge(root, "codex", input("c", "UserPromptSubmit", { prompt: "native process" }));
-  await bridge(root, "codex", input("c", "Stop", { last_assistant_message: "persisted result" }));
-  const output = await bridge(root, "zcode", input("z", "UserPromptSubmit", { prompt: "continue" }));
+  // Simulate the model's internal decision after each native prompt hook.
+  const router = new IntentRouting({root});
+  const decide = async (harness, session) => {
+    const dirPath = await router.directory(dir, harness, session);
+    const route = JSON.parse(await fs.readFile(path.join(dirPath,"route.json"),"utf8"));
+    return router.decide({cwd:dir,harness,session,ticket:route.ticket,mode:"continue"});
+  };
+  await bridge(root, "codex", input("c", "UserPromptSubmit", { prompt: "native process", turn_id:"one" }));
+  await decide("codex","c");
+  await bridge(root, "codex", input("c", "Stop", { turn_id:"one", last_assistant_message: "persisted result" }));
+  await bridge(root, "zcode", input("z", "UserPromptSubmit", { prompt: "continue", turn_id:"two" }));
+  const output = await decide("zcode","z");
   assert.match(output.hookSpecificOutput.additionalContext, /persisted result/);
   assert.equal((await autoStatus(root, dir)).owner.key, "zcode:z");
 });

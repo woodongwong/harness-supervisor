@@ -1,8 +1,8 @@
 # Harness Relay
 
-在不同 coding harness 之间接续同一个开发任务，保留任务目标、待办、验证结果和工作目录。目前支持 Codex 和 ZCode，其他 harness 可通过适配器接入。
+在不同 coding harness 之间接续同一个开发任务，保留任务目标、待办、验证结果和工作目录。目前支持 Codex、ZCode 和 CodeBuddy CLI 的原生 Hook 交接，其他 harness 可通过适配器接入。
 
-通过 Hook 自动交接，通过 Skill 维护跨轮次任务状态，通过 Git worktree 隔离同项目的并行任务。接入后，在目标客户端打开同一任务目录并正常发送消息即可继续工作。
+通过 Hook 自动保存进展和交接，Skill 提供续接指导及可选任务笔记，通过 Git worktree 隔离同项目的并行任务。接入后，在目标客户端打开同一任务目录并正常发送消息即可继续工作。
 
 首次使用请从[自动交接配置](#自动交接日常直接使用-codex--zcode)开始；需要并行开发时，为每个独立任务[创建 worktree](#同项目并行一个任务一个-worktree)。
 
@@ -21,11 +21,16 @@ node src/cli.mjs task-list --repo /path/to/git-repo
 ```bash
 node src/cli.mjs task-open task-实际编号 --in codex
 node src/cli.mjs task-open task-实际编号 --in zcode
+node src/cli.mjs task-open task-实际编号 --in codebuddy
 ```
 
-`task-open` 启动原生客户端，并传入该任务的 worktree 路径；不发送任务消息、不更换模型。Linux 上 ZCode 桌面程序默认 `/opt/ZCode/zcode`，其他安装位置可设置 `ZCODE_DESKTOP_BIN`。ZCode 的目录打开行为需以所装客户端实际支持为准；也可省略 `--in` 查看路径，再在客户端手动打开该目录。Codex 使用 `CODEX_BIN` 或 PATH 中的 `codex`。
+`task-open --in` 默认打印一条在新终端运行的命令，不启动客户端，也不改变当前会话目录。这样 agent 创建任务后可以结束本轮，避免嵌套客户端使原目录一直处于占用状态。Codex 使用 `CODEX_BIN` 或 PATH 中的 `codex`；Linux ZCode 默认 `/opt/ZCode/zcode`，可用 `ZCODE_DESKTOP_BIN` 覆盖。省略 `--in` 时只打印 worktree 路径。
 
-之后正常聊天即可：在任务 A 的 worktree 内，Codex 与 ZCode 自动共享 A 的进展；任务 B 使用另一个 worktree，可以同时运行。仅打开窗口不抢占，实际发送消息时才交接。两端必须打开命令打印的同一个任务 worktree，打开原始仓库目录不会猜测你想接续哪个任务。
+需要自动打开独立终端时，配置本机已安装的终端启动器参数数组，例如支持该语法的 GNOME Terminal 可用 `HARNESS_RELAY_TERMINAL_JSON='["gnome-terminal","--"]'`，然后执行 `task-open <task-id> --in codex --terminal`。Relay 直接传递参数，不通过 shell 拼接；发出启动请求即返回，不等待 Codex 退出，也不声称已验证客户端就绪。当前环境没有终端启动器时，使用默认输出的命令手动打开即可。仅供用户在真实终端直接运行的 `--interactive` 保留前台启动方式；agent 不应使用它，即使工具分配了 PTY。
+
+新窗口中先确认客户端显示的目录等于任务 worktree，再发送开发要求。新开一个仍指向原项目的窗口，或仅在消息中写“独立 worktree”，都不会产生隔离。
+
+之后正常聊天即可：在任务 A 的 worktree 内，各 harness 可以接续 A 的进展；独立任务 B 使用另一个 worktree。打开窗口和发送消息都不直接抢占；模型先结合请求及历史判断意图，只有续接工作才申请执行权。
 
 worktree 及其子目录、指向它们的符号链接都关联同一个任务；嵌套的另一个 Git 仓库不会继承父任务。列表按 Git 公共仓库目录分组，从主仓库或任意关联 worktree 查询都能看到同项目任务。
 
@@ -52,6 +57,28 @@ node src/cli.mjs task-close task-实际编号
 
 创建失败会保留任务记录和可能已创建的目录以供检查，不会强制删除。不是 Git 仓库、没有提交或基点无效时，创建命令会报错，工具不会擅自初始化业务目录。
 
+### 显式完成并合并任务
+
+安装器会同时分发英文 `harness-handoff` 和 `harness-finish` Skill。可明确调用：
+
+```text
+使用 $harness-finish，将任务 task-实际编号合并到 main，验证通过后清理 worktree 和任务分支。
+```
+
+Skill 指导 agent 审查、测试、提交任务代码，再合并、验证，按请求清理或 push。新增 `task-integrate` 接受明确的源/目标提交、目标目录和验证命令参数数组，检查空闲状态、固定提交及干净工作区后执行合并和验证。默认保留 worktree 和分支，不自动 push。后台 worker 若已获任务中的合并授权，可登记 `task-plan-finish`，进程退出后自动尝试收尾，无需用户再次输入命令。未获授权时保持 review_pending；不根据 Stop 或退出码推断合并授权。
+
+手动诊断入口（正常使用由模型处理）：
+
+```text
+node src/cli.mjs task-run <task-id> --in codex
+node src/cli.mjs task-job <task-id>
+node src/cli.mjs task-integrate <task-id> --target <target-worktree> --branch main --source-commit <full-SHA> --target-commit <full-SHA> --verify-json '["npm","test"]'
+```
+
+在活动的目标目录会话中，模型还需提供当前轮次的 `--lease`。其他目标会话活动、源工具未确认结束、提交变化、Git 冲突或验证失败时保留现场，不强行接管。结果与验证输出保存在任务目录的 `integration.json` 和验证日志中。收尾计划是模型根据用户授权登记的，不是独立的权限安全边界。
+
+源任务必须空闲且无在途工具，目标目录不能有冲突中的 Git 操作或无关未提交改动。清理前再次验证提交已合入目标，并检查未跟踪及忽略文件；不会强制删除 worktree。多个任务逐个合并并验证。合并冲突或测试失败时保留现场与任务记录。
+
 ## 自动交接：日常直接使用 Codex / ZCode
 
 一次性接入需要共享任务的项目：
@@ -65,21 +92,63 @@ node src/cli.mjs setup-auto --cwd /path/to/project
 
 在 Codex 中通过 `/hooks` 一次性审阅并信任新 Hook，然后两端新建会话。ZCode 使用官方用户级 Hook，无需再安装旧 bridge 插件。Codex 的信任属于客户端要求，安装器不篡改信任记录。
 
+### CodeBuddy CLI
+
+为已登记项目增加 CodeBuddy 接入（只修改 CodeBuddy 用户配置，不重新登记任务）：
+
+```bash
+node src/cli.mjs setup-auto --harness codebuddy
+```
+
+新项目可同时安装三端 Hook 并登记目录：
+
+```bash
+node src/cli.mjs setup-auto --cwd /path/to/project --harness codex,zcode,codebuddy
+```
+
+CodeBuddy 配置写入 `~/.codebuddy/settings.json`，两个 Skill 链接到 `~/.codebuddy/skills/harness-handoff` 和 `~/.codebuddy/skills/harness-finish`；可用 `CODEBUDDY_CONFIG_DIR` 指定配置目录。安装器保留原模型设置及其他 Hook，并备份被改动的配置。按[官方 Hook 指南](https://www.codebuddy.cn/docs/cli/hooks-guide)在 `/hooks` 面板检查配置；2.150.0 面板提示外部配置变更需重启。Web UI 的插件计数不包含用户级 Hook。安装器不修改客户端信任记录。在同一任务目录运行 `codebuddy`，发送普通消息即可接力，也可用 `task-open --in codebuddy`；自定义可执行文件用 `CODEBUDDY_BIN`。
+
+CLI 2.150.0 中用户拒绝工具的交互路径可能不发送 PostToolUse/Stop。下一条消息会核对原生转录中的精确会话、轮次、调用编号、参数及用户拒绝记录，证实工具未启动才清理占用。同会话随后可以继续；其他会话仍需旧轮次的结束证据。普通执行失败、模糊取消文本、缺失或截断的证据不触发解锁。被拒绝的命令不会由恢复逻辑重新执行。
+
+协议及一次真实命令闭环已用 CLI **2.150.0** 验证：`generation_id` 关联轮次，`tool_use_id` / `call_id` 关联工具，`PostToolUseFailure` 记录失败，Stop 保存最终回复。缺少必要编号的工具调用会被阻止，不按相同命令猜测关联；不带轮次编号的 SessionEnd 不会释放执行权。CodeBuddy 的 `continue:false` 在 Stop 上表示继续运行，因此 Relay 不用它要求会话结束。当前只接入原生 Hook、被动检查点、Skill 和 worktree 启动；旧的 `run/resume/takeover` 托管执行流程及其 `capabilities` 列表尚未接入 CodeBuddy。
+
 之后的操作就是平常聊天：
 
 - 在 Codex 发任务，系统自动建立项目任务记录。
 - 换到 ZCode，在同一个目录发送“继续实现”或其他普通消息，自动注入此前进展与当前 Git 状态。
 - 再回 Codex 发送“检查结果”，自动读取 ZCode 的工作记录。
 
-不需要 task ID、bind、unbind、takeover，也不要求先耗尽额度。仅打开窗口不会触发切换；发送消息才表示该会话要继续工作。已有原生会话保留自己的历史，新会话接收共享记录，不自动恢复另一个客户端的隐藏状态。
+不需要用户填写 task ID、bind、unbind、takeover，也不要求先耗尽额度。已有原生会话保留自己的历史，新会话接收共享记录，不自动恢复另一个客户端的隐藏状态。
+
+### 模型判断意图，Hook 执行边界
+
+原生消息 Hook 先注入当前任务、最近请求和结束回复供当前模型判断，不调用另一个模型，也不按关键词直接抢占。普通问题可以直接回答；在执行工具前，模型调用注入的内部 `route` 命令选择续接、问答或独立开发。用户不必表达模式，也不必调用 Skill。判断依赖模型，不能保证永远准确；有影响操作结果的歧义时仍需澄清。
+
+问答保存在该会话的 `routes/<id>/route.json`，不污染开发任务检查点，不设置接管等待，也不停止原任务。当前问答通道只允许直接文字回答；需要工具检查时模型须申请续接。续接取得写入权后才注入完整交接材料。独立开发自动创建新的 managed worktree；重复相同决定不会创建重复任务。票据按目录、harness、会话和轮次关联，过期决定不能抢占已经推进的任务。部署前已开始的旧轮次继续受原工具守卫管理。
+
+独立 worktree 创建后，`new` 路由自动启动独立后台 worker，将任务要求直接交给客户端，不再依赖桌面终端，也不要求用户复制第二条命令。Codex 使用 `exec --json`，CodeBuddy 使用 `-p --output-format json --permission-mode bypassPermissions`；CodeBuddy 的后台进程没有可交互的权限确认界面，因此任务入队后会显式使用无人值守权限模式。ZCode 需要已配置的非交互启动参数模板，未配置时保留任务并报告限制，不换 harness。Hook 提供模型名时传给新 worker；其他设置沿用该 CLI 配置。当前原生会话目录仍不改变。
+
+启动器立即返回，持久化的 `job.json` 防止重复启动；独立进程将输出写入任务目录的 worker 日志，保存退出码、可识别的最终答复和失败状态。`review_pending` 仅表示进程成功返回；已授权的收尾计划成功后才为 `integrated`，被占用或验证失败则为 `integration_blocked`。后续消息注入同项目最近后台任务的简短状态，`status` 也展示后台状态。当前没有向闲置原生聊天窗口主动推送消息的 API；结果在下一轮查询/聊天时可见。
+
+后台任务期间其他 Relay 会话不能接管其 worktree。进程崩溃导致的 queued/running 残留不会根据计时自动重新执行任务，避免重复副作用；未完成的计划和日志保留供核对。受控后台执行不等于隔离沙箱，客户端的路径和权限约束仍由其自身执行。
+
+完整链路已用 CodeBuddy CLI 2.150.0 的真实模型和临时 Git 仓库验收：自然语言被判断为独立任务，Relay 创建 worktree 并启动后台 worker，模型修改代码、运行测试并提交，原生进程退出后 Relay 合并到 `main`、再次运行测试并清理任务 worktree 和分支。错误保留、提交漂移、脏目标目录、冲突和验证失败另有进程级测试。后台结果并非实时推送到原窗口。
+
+已通过 CodeBuddy CLI 的真实模型测试：活动任务旁的普通时间问题直接作答，原任务状态完全不变；“继续完成刚才留下的验证”由模型调用内部路由并执行验证命令，Pre/Post/Stop 闭环结束后无工具残留。Codex 与 ZCode 的新路由通过协议测试；不据此声称所有客户端的模型判断都已实测。
 
 如果旧会话仍在执行，新消息的 Hook 会等待最多 45 秒，旧会话后续工具会被拒绝，正在运行的工具需先收到完成事件；确认本轮停止后才转交。等待超时会阻断本次消息并说明原因，不会按时间强行认定旧进程已停止。客户端崩溃、取消后漏报工具完成、其他 Hook 要求继续等情况可能需要人工处理；不能保证任意外部进程都能自动中止。
 
 Codex 的同步 `apply_patch` 校验失败可能缺少 `PostToolUse`。当日志同时记录同一会话、同一轮次的补丁开始和后续 Stop 时，Relay 会释放这条残留工具记录，并将结果标为未知，避免下一条消息永久等待。此规则不适用于 Bash、MCP、未知工具或仅收到 Interrupt/SessionEnd 的情况；不会把释放记录当作补丁成功。
 
+如果连 Stop 也漏报，下一条消息会核对原生转录中的会话、工作目录、轮次及 `task_complete` 时间。精确匹配才补记轮次结束，并清理此前的同步补丁占用；日志注明原生证据来源，不伪造 Stop。Bash、MCP 等未确认工具仍保留。证据缺失、截断或位于读取窗口之外时继续等待，不凭空闲时长或最终回复文字解锁。
+
+异步 Bash 命令即使没有被再次轮询，也可能已在原生转录中留下 `item_completed / CommandExecution`。Relay 会匹配会话、轮次、调用编号、目录、完整命令和时间，只有终态与整数退出码同时存在才清理占用。先收到 SessionEnd 也不会跳过后续原生核对；仅有进程编号、仍执行中或缺少退出码时保留占用。退出码只证明命令返回，不代表其中每个步骤或业务验收成功。
+
+会话目录按原生 `turn_context` 核对；命令可以显式在另一个绝对路径下执行，有 Hook `workdir` 时另行核对执行目录。工具完成核对默认读取转录末尾 4 MiB，未匹配时最多扩大到 16 MiB，覆盖终端大量输出挤出轮次信息的情况；仍无精确证据则保留占用。维护恢复只会清理已过期的交接等待，不会覆盖有效的接管请求。
+
 对于 Codex 创建进程前拒绝的 Bash 调用，Relay 会在 Stop 后核对原生转录中的会话、轮次、单次字面量 `exec_command` 调用、完整命令、开始时间及对应的 `CreateProcess Rejected` 错误。证据匹配才释放记录，并标记为“未启动”。此兼容逻辑目前识别 `const r = await tools.exec_command({...}); text(JSON.stringify(r));` 形式；转录格式变化、证据缺失、复杂或并行脚本、已启动的进程均不会据此释放。读取限于转录头部和末尾 4 MiB，核对不会重新执行命令。
 
-每个 worktree（或单独启用的目录）只关联一个主任务，不同 worktree 可以并行。直接创建子智能体的调用会被阻止，交接材料也要求不要启动脱离会话的后台写入。Hook 不是完整进程隔离机制，未接入的终端、已有未加载 Hook 的会话及绕过 Hook 的操作不受它控制。
+每个 worktree（或单独启用的目录）只关联一个主任务，不同 worktree 可以并行。直接创建未受管理子智能体的调用会被阻止；Relay 自身的后台任务有独立 worktree、持久化任务记录及占用守卫。Hook 不是完整进程隔离机制，未接入的终端、已有未加载 Hook 的会话及绕过 Hook 的操作不受它控制。
 
 ```bash
 node src/cli.mjs auto-status --cwd /path/to/project

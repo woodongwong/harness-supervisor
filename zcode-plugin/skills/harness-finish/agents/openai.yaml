@@ -1,0 +1,4 @@
+interface:
+  display_name: "Harness Finish"
+  short_description: "Merge and verify a completed worktree task"
+  default_prompt: "Use $harness-finish to finish and merge the selected worktree task into its target branch."

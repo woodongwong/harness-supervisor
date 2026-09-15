@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import { projectIdentity } from "./worktree-tasks.mjs";
 import { taskIdentity, identityLine } from "./task-identity.mjs";
 import { hasPendingWork } from "./task-progress.mjs";
+import { readJob } from "./task-jobs.mjs";
 
 async function projectTasks(store, project) {
   let entries;
@@ -36,7 +37,9 @@ export async function workspaceStatus(store, cwd, { repo } = {}) {
       if (error.code === "ENOENT") return null;
       throw error;
     });
-    return { ...taskIdentity(item, state?.taskId === item.id ? state : null), hasPendingWork: hasPendingWork(item.progress) };
+    const job = await readJob(store,item.id);
+    return { ...taskIdentity(item, state?.taskId === item.id ? state : null), hasPendingWork: hasPendingWork(item.progress),
+      job:job?{status:job.status,exitCode:job.exitCode,error:job.error}:null };
   }));
   return { cwd, current: task ? taskIdentity(task, registration) : null, project: project?.top ?? null, tasks: rows };
 }
@@ -50,7 +53,7 @@ export function formatWorkspaceStatus(report) {
     "执行会话表示当前持有执行权的会话，不一定是发起本次查询的会话。",
   ] : ["当前目录未关联任务；不会自动选择其他 worktree 的任务。"];
   lines.push("", "同项目任务：");
-  for (const task of report.tasks) lines.push(`${task.taskId === current?.taskId ? "*" : "-"} ${task.taskId} [${task.status}] ${identityLine(task)}${task.hasPendingWork ? " · 有待办" : ""}\n  登记分支：${task.branch ?? "未登记"}\n  ${task.cwd}`);
+  for (const task of report.tasks) lines.push(`${task.taskId === current?.taskId ? "*" : "-"} ${task.taskId} [${task.status}] ${identityLine(task)}${task.hasPendingWork ? " · 有待办" : ""}${task.job?` · 后台 ${task.job.status}`:""}\n  登记分支：${task.branch ?? "未登记"}\n  ${task.cwd}`);
   if (!report.tasks.length) lines.push("暂无已登记任务。");
   return lines.join("\n");
 }

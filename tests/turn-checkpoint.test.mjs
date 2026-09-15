@@ -98,6 +98,9 @@ test("skill installation shares the maintained source with both clients and pres
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const options = { codexHome: path.join(dir, "codex"), zcodeHome: path.join(dir, "zcode", "cli") };
   const targets = await installHandoffSkill(options);
+  assert.equal(targets.length, 4);
+  assert.equal(await fs.realpath(targets[2]), await fs.realpath(targets[3]));
+  assert.equal(path.basename(targets[2]), "harness-finish");
   assert.equal(await fs.realpath(targets[0]), await fs.realpath(targets[1]));
   assert.deepEqual(await installHandoffSkill(options), targets);
   await fs.unlink(targets[1]);
